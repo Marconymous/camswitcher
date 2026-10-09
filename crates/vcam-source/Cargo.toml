@@ -1,0 +1,27 @@
+[package]
+name = "vcam-source"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+shared.workspace = true
+log.workspace = true
+simplelog = "0.12"
+windows-core.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_System_Variant",
+] }
+
+[lints.rust]
+linker_messages = "allow"

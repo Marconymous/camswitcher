@@ -1,0 +1,48 @@
+# CamSwitch
+
+Pick several connected cameras, switch between them with global hotkeys, and expose the result as one
+virtual camera ("CamSwitch Camera") that Teams, Zoom, browsers and the Windows Camera app can select.
+Windows 11 only (uses `MFCreateVirtualCamera`).
+
+## Layout
+
+- `crates/app` – `camswitch.exe`: egui UI, camera capture (Media Foundation), compositor, global hotkeys,
+  virtual camera registration.
+- `crates/vcam-source` – `vcam_source.dll`: COM media source loaded by the Windows Frame Server service.
+- `crates/shared` – shared-memory frame protocol and image helpers used by both.
+
+## Build & run
+
+```powershell
+cargo build                      # or: cargo build --release
+.\scripts\register.ps1           # elevated; re-run after every DLL change (-Release for release build)
+.\target\debug\camswitch.exe
+```
+
+`register.ps1` copies the DLL to `C:\Program Files\CamSwitch` (Frame Server runs as LocalService and
+must be able to read it), registers the COM class under HKLM and stops Frame Server so an old DLL is
+released. `.\scripts\register.ps1 -Unregister` removes it.
+
+The virtual camera exists only while `camswitch.exe` runs.
+
+## Default hotkeys
+
+| Action           | Keys                    |
+|------------------|-------------------------|
+| Camera 1–9       | Ctrl+Alt+Shift+1…9      |
+| Next / previous  | Ctrl+Alt+Shift+→ / ←    |
+| Mute (black)     | Ctrl+Alt+Shift+M        |
+
+Shift is included because Ctrl+Alt equals AltGr on many keyboard layouts. All bindings can be changed in
+the app (Hotkeys section).
+
+## Switch modes
+
+- **Instant**: all selected cameras stream, switching is immediate (more USB bandwidth/CPU).
+- **On demand**: only the active camera streams; on a switch the previous camera keeps feeding the output
+  until the new one delivers its first frame.
+
+## Logs
+
+- App: `%APPDATA%\CamSwitch\config\camswitch.log`, settings in `config.toml` next to it.
+- DLL: `C:\ProgramData\CamSwitch\vcam.log` (or `vcam-<pid>.log` when the host process can't share it).

@@ -1,0 +1,13 @@
+[package]
+name = "shared"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+] }
