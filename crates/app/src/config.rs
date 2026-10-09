@@ -89,6 +89,31 @@ impl Default for Transform {
 
 pub const MAX_ZOOM: f32 = 4.0;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TransitionKind {
+    /// Switch immediately.
+    #[default]
+    Cut,
+    /// Crossfade from the previous camera.
+    Fade,
+}
+
+/// How the output changes from one camera to the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Transition {
+    pub kind: TransitionKind,
+    pub duration_ms: u32,
+}
+
+impl Default for Transition {
+    fn default() -> Self {
+        Self { kind: TransitionKind::Cut, duration_ms: 300 }
+    }
+}
+
+pub const TRANSITION_MS: std::ops::RangeInclusive<u32> = 100..=1500;
+
 /// Hotkeys in `global-hotkey` string form, e.g. `ctrl+alt+shift+KeyM`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -134,6 +159,7 @@ pub struct Config {
     pub start_minimized: bool,
     /// Briefly show the new state on screen after a hotkey or tray action.
     pub show_toast: bool,
+    pub transition: Transition,
 }
 
 impl Default for Config {
@@ -149,6 +175,7 @@ impl Default for Config {
             close_to_tray: true,
             start_minimized: false,
             show_toast: true,
+            transition: Transition::default(),
         }
     }
 }
@@ -203,6 +230,7 @@ mod tests {
         c.placeholder_image = StillSource::Black;
         c.close_to_tray = false;
         c.start_minimized = true;
+        c.transition = Transition { kind: TransitionKind::Fade, duration_ms: 500 };
         let text = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.selected[0].name, "Cam A");
@@ -216,12 +244,14 @@ mod tests {
         assert_eq!(back.muted_image, c.muted_image);
         assert_eq!(back.placeholder_image, StillSource::Black);
         assert!(!back.close_to_tray && back.start_minimized && back.show_toast);
+        assert_eq!(back.transition, c.transition);
 
         let partial: Config = toml::from_str("mode = \"Cold\"").unwrap();
         assert_eq!(partial.hotkeys.cameras.len(), CAMERA_HOTKEY_SLOTS);
         assert!(!partial.pause_when_idle);
         assert_eq!(partial.muted_image, StillSource::ColorBars);
         assert!(partial.close_to_tray && !partial.start_minimized && partial.show_toast);
+        assert_eq!(partial.transition, Transition::default());
     }
 
     #[test]

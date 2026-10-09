@@ -18,5 +18,9 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+# Per-pixel image code runs every frame; keep it fast in dev builds too.
+[profile.dev.package.shared]
+opt-level = 3
+
 [profile.release]
 lto = "thin"

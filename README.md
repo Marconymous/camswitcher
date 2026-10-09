@@ -58,6 +58,9 @@ preview and the virtual camera and are saved per camera.
 - **On demand**: only the active camera streams; on a switch the previous camera keeps feeding the output
   until the new one delivers its first frame.
 
+**Transition**: *Cut* switches immediately, *Fade* crossfades from the previous camera (100–1500 ms). In
+On-demand mode the fade starts once the new camera delivers its first frame.
+
 ## Debug info
 
 Press **F12** (or "🐞 Debug info" in the window) for a separate window with live stats: per-camera native

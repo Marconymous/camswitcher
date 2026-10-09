@@ -2,9 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::capture::{CamStatus, Capture, Slot};
-use crate::config::{Config, SelectedCam, StillSource, SwitchMode, Transform};
+use crate::config::{Config, SelectedCam, StillSource, SwitchMode, Transform, TransitionKind};
 use crate::devices::{DeviceInfo, DeviceList};
 use crate::stills::Still;
 
@@ -27,6 +28,8 @@ pub struct Core {
     captures: HashMap<String, Capture>,
     /// Cold mode: previous camera, kept streaming until the new one delivers.
     fallback: Option<String>,
+    /// Crossfade in progress from the previous camera.
+    fade: Option<Fade>,
     /// Nobody watches (no consumer, window hidden); set by the compositor.
     idle: bool,
     /// Indexed by [`StillKind`].
@@ -38,10 +41,19 @@ pub struct Core {
     render_version: u64,
 }
 
+/// A crossfade from `from` to the active camera.
+struct Fade {
+    from: String,
+    /// Set once the active camera has a picture.
+    started: Option<Instant>,
+}
+
 /// What the compositor should show.
 pub struct OutputSources {
     pub active: Option<(Arc<Slot>, Transform)>,
     pub fallback: Option<(Arc<Slot>, Transform)>,
+    /// Camera being faded out and the fade progress (0 = only it, 1 = done).
+    pub fade_from: Option<((Arc<Slot>, Transform), f32)>,
     pub muted: bool,
     pub muted_still: Still,
     pub placeholder: Still,
@@ -58,6 +70,7 @@ impl Core {
             muted: false,
             captures: HashMap::new(),
             fallback: None,
+            fade: None,
             idle: false,
             stills: [Still::ColorBars, Still::ColorBars],
             still_errors: [None, None],
@@ -126,10 +139,14 @@ impl Core {
         if self.active.as_deref() == Some(link) || !self.is_selected(link) || !self.is_present(link) {
             return;
         }
+        // Keep showing the old camera only if it actually has a picture.
+        let old = self.active.take().filter(|old| self.slot(old).is_some_and(|s| s.has_frame()));
         if self.config.mode == SwitchMode::Cold {
-            // Keep showing the old camera only if it actually has a picture.
-            self.fallback = self.active.take().filter(|old| self.slot(old).is_some_and(|s| s.has_frame()));
+            self.fallback = old.clone();
         }
+        self.fade = old
+            .filter(|_| self.config.transition.kind == TransitionKind::Fade)
+            .map(|from| Fade { from, started: None });
         self.active = Some(link.to_string());
         self.config.last_active = self.active.clone();
         self.config.save();
@@ -158,6 +175,7 @@ impl Core {
         if self.config.mode != mode {
             self.config.mode = mode;
             self.fallback = None;
+            self.fade = None;
             self.config.save();
             self.reconcile();
         }
@@ -261,6 +279,17 @@ impl Core {
         self.render_version += 1;
     }
 
+    /// `save` writes the config (skip it while a slider is dragged).
+    pub fn set_transition(&mut self, t: crate::config::Transition, save: bool) {
+        self.config.transition = t;
+        if t.kind == TransitionKind::Cut {
+            self.fade = None;
+        }
+        if save {
+            self.config.save();
+        }
+    }
+
     pub fn set_pause_when_idle(&mut self, on: bool) {
         if self.config.pause_when_idle != on {
             self.config.pause_when_idle = on;
@@ -286,6 +315,19 @@ impl Core {
 
     /// Called every compositor frame: completes Cold-mode switches.
     pub fn tick(&mut self) {
+        if let Some(fade) = &self.fade {
+            let active = self.active.as_deref().and_then(|a| self.slot(a));
+            let has_frame = active.is_some_and(|s| s.has_frame());
+            let failed = active.is_none_or(|s| matches!(*s.status.lock(), CamStatus::Failed(_)));
+            let duration = Duration::from_millis(self.config.transition.duration_ms as u64);
+            let done = failed || !self.is_present(&fade.from) || fade.started.is_some_and(|t| t.elapsed() >= duration);
+            if done {
+                self.fade = None;
+                self.reconcile();
+            } else if fade.started.is_none() && has_frame {
+                self.fade.as_mut().unwrap().started = Some(Instant::now());
+            }
+        }
         if self.fallback.is_some() {
             let done = match self.active.as_deref().and_then(|a| self.slot(a)) {
                 Some(slot) => slot.has_frame() || matches!(*slot.status.lock(), CamStatus::Failed(_)),
@@ -302,6 +344,11 @@ impl Core {
         OutputSources {
             active: self.active.as_deref().and_then(|a| Some((self.slot(a)?.clone(), self.transform(a)))),
             fallback: self.fallback.as_deref().and_then(|f| Some((self.slot(f)?.clone(), self.transform(f)))),
+            fade_from: self.fade.as_ref().and_then(|f| {
+                let duration = self.config.transition.duration_ms.max(1) as f32 / 1000.0;
+                let t = f.started.map_or(0.0, |t| (t.elapsed().as_secs_f32() / duration).min(1.0));
+                Some(((self.slot(&f.from)?.clone(), self.transform(&f.from)), t))
+            }),
             muted: self.muted,
             muted_still: self.stills[StillKind::Muted as usize].clone(),
             placeholder: self.stills[StillKind::Placeholder as usize].clone(),
@@ -318,6 +365,7 @@ impl Core {
             SwitchMode::Cold => self.active.iter().cloned().collect(),
         };
         wanted.extend(self.fallback.iter().cloned());
+        wanted.extend(self.fade.iter().map(|f| f.from.clone()));
         wanted.retain(|l| self.is_present(l));
         wanted
     }

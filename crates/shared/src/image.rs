@@ -275,6 +275,15 @@ pub fn smpte_bars_bgra(dst: &mut Vec<u8>, w: u32, h: u32) {
     }
 }
 
+/// Crossfade: `dst = dst * (1 - t) + src * t` per channel, `t` in 0..=1.
+/// Both buffers BGRA of equal length.
+pub fn blend_bgra(dst: &mut [u8], src: &[u8], t: f32) {
+    let w = (t.clamp(0.0, 1.0) * 256.0).round() as u32;
+    for (d, s) in dst.iter_mut().zip(src) {
+        *d = ((*d as u32 * (256 - w) + *s as u32 * w + 128) >> 8) as u8;
+    }
+}
+
 /// Swaps B and R in place (BGRA <-> RGBA).
 pub fn swap_rb(buf: &mut [u8]) {
     for px in buf.chunks_exact_mut(4) {
@@ -373,6 +382,20 @@ mod tests {
         assert_eq!(zoom_rect(1920, 1080, 2.0, [0.5, 0.5]), (480, 270, 960, 540));
         // Panned past the edge: clamped inside.
         assert_eq!(zoom_rect(1920, 1080, 2.0, [1.0, 0.0]), (960, 0, 960, 540));
+    }
+
+    #[test]
+    fn blend_endpoints_and_middle() {
+        let a = [0u8, 100, 200, 255];
+        let b = [200u8, 0, 100, 255];
+        let mut d = a;
+        blend_bgra(&mut d, &b, 0.0);
+        assert_eq!(d, a);
+        blend_bgra(&mut d, &b, 1.0);
+        assert_eq!(d, b);
+        let mut d = a;
+        blend_bgra(&mut d, &b, 0.5);
+        assert_eq!(d, [100, 50, 150, 255]);
     }
 
     #[test]

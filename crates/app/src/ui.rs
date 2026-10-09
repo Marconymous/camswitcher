@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 
 use crate::capture::CamStatus;
 use crate::compositor::{PREVIEW_HEIGHT, PREVIEW_WIDTH, Preview};
-use crate::config::{Fit, MAX_ZOOM, Rotation, StillSource, SwitchMode, Transform};
+use crate::config::{Fit, MAX_ZOOM, Rotation, StillSource, SwitchMode, TRANSITION_MS, Transform, TransitionKind};
 use crate::core::{Core, StillKind};
 use crate::devices::{DeviceInfo, DeviceList};
 use crate::hotkeys::{self, Action, Hotkeys};
@@ -44,8 +44,8 @@ pub struct App {
     pub start_hidden: Option<u8>,
     /// Camera whose picture adjustments are open (symbolic link).
     pub editing: Option<String>,
-    /// A transform changed while a slider was held; saved on release.
-    pub transform_dirty: bool,
+    /// A setting changed while a slider may be held; saved on release.
+    pub config_dirty: bool,
 }
 
 impl Drop for App {
@@ -158,7 +158,7 @@ impl App {
                 ui.indent(("transform", i), |ui| transform_ui(ui, &mut t));
                 if t != core.transform(&cam.link) {
                     core.set_transform(&cam.link, t, false);
-                    self.transform_dirty = true;
+                    self.config_dirty = true;
                 }
             }
         }
@@ -188,6 +188,21 @@ impl App {
         ui.radio_value(&mut mode, SwitchMode::Hot, "Instant — all selected cameras stay on");
         ui.radio_value(&mut mode, SwitchMode::Cold, "On demand — only the active camera is on");
         core.set_mode(mode);
+        let mut tr = core.config.transition;
+        ui.horizontal(|ui| {
+            ui.label("Transition");
+            ui.selectable_value(&mut tr.kind, TransitionKind::Cut, "Cut");
+            ui.selectable_value(&mut tr.kind, TransitionKind::Fade, "Fade")
+                .on_hover_text("Crossfade from the previous camera. In On-demand mode the fade starts once the new camera delivers.");
+            ui.add_enabled(
+                tr.kind == TransitionKind::Fade,
+                egui::Slider::new(&mut tr.duration_ms, TRANSITION_MS).suffix(" ms").step_by(50.0),
+            );
+        });
+        if tr != core.config.transition {
+            core.set_transition(tr, false);
+            self.config_dirty = true;
+        }
         let mut pause = core.config.pause_when_idle;
         if ui
             .checkbox(&mut pause, "Pause cameras when nobody is watching")
@@ -514,9 +529,9 @@ impl eframe::App for App {
             self.preview_ui(ui);
         });
         self.debug_window(&ctx);
-        // Slider drags change the transform every frame; write the config once released.
-        if self.transform_dirty && !ctx.input(|i| i.pointer.any_down()) {
-            self.transform_dirty = false;
+        // Slider drags change settings every frame; write the config once released.
+        if self.config_dirty && !ctx.input(|i| i.pointer.any_down()) {
+            self.config_dirty = false;
             self.core.lock().config.save();
         }
         // Keep polling device changes even without frames.

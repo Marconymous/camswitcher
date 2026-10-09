@@ -204,6 +204,7 @@ fn compositor_section(stats: &CompositorStats, output_size: (u32, u32)) -> Secti
     let source = match stats.source {
         OutputSource::Active => "active camera",
         OutputSource::Fallback => "previous camera (switching)",
+        OutputSource::Fade => "crossfade to active camera",
         OutputSource::Placeholder => "placeholder picture",
         OutputSource::Muted => "muted picture",
         OutputSource::Unwatched => "nothing (nobody watching)",

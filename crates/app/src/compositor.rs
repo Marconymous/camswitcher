@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use shared::image::{bgra_to_nv12, cover_rect, fill_black_bgra, fit_rect, rotate_bgra, scale_bgra_letterbox, scale_bgra_rect, swap_rb, zoom_rect};
+use shared::image::{bgra_to_nv12, blend_bgra, cover_rect, fill_black_bgra, fit_rect, rotate_bgra, scale_bgra_letterbox, scale_bgra_rect, swap_rb, zoom_rect};
 use shared::shm::{FrameShm, MAX_HEIGHT, MAX_WIDTH, ShmHeader};
 use shared::stats::{Snapshot, Window};
 
@@ -37,6 +37,8 @@ pub enum OutputSource {
     Active,
     /// Cold mode: previous camera while the new one starts.
     Fallback,
+    /// Crossfade from the previous camera to the active one.
+    Fade,
     Muted,
     /// Nobody watches; no camera frame is used.
     Unwatched,
@@ -199,16 +201,45 @@ pub fn spawn(
         .expect("spawn compositor");
 }
 
-/// Identity of what was last rendered: frame id (0 = none), mute, output size,
-/// stills/transform version.
-type RenderKey = (u64, bool, u32, u32, u64);
+/// Identity of what was last rendered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RenderKey {
+    /// Frame id, 0 = none.
+    frame: u64,
+    /// Fading-out frame id and progress in 1/255.
+    fade: Option<(u64, u8)>,
+    muted: bool,
+    size: (u32, u32),
+    /// Stills / transforms version.
+    version: u64,
+}
 
-/// Draws `frame` with its camera's adjustments into `dst` (`w` x `h` BGRA),
-/// or `still` without one. `scratch` holds the rotated frame.
-fn render(frame: Option<(&Frame, &Transform)>, still: &Still, scratch: &mut Vec<u8>, dst: &mut Vec<u8>, w: u32, h: u32) {
-    match frame {
-        Some((f, t)) => render_frame(f, t, scratch, dst, w, h),
-        None => still.draw(dst, w, h),
+/// What to draw: a camera frame with its adjustments, optionally crossfading
+/// from the previous camera, or a still picture.
+struct Picture<'a> {
+    frame: Option<(&'a Frame, &'a Transform)>,
+    /// Previous camera and the new one's weight (0..1).
+    fade_from: Option<(&'a Frame, &'a Transform, f32)>,
+    still: &'a Still,
+}
+
+/// Reusable buffers for [`render`].
+#[derive(Default)]
+struct Scratch {
+    rotated: Vec<u8>,
+    blend: Vec<u8>,
+}
+
+/// Draws `pic` into `dst` (`w` x `h` BGRA).
+fn render(pic: &Picture, scratch: &mut Scratch, dst: &mut Vec<u8>, w: u32, h: u32) {
+    match (pic.frame, pic.fade_from) {
+        (Some((f, t)), Some((from, from_t, a))) => {
+            render_frame(from, from_t, &mut scratch.rotated, dst, w, h);
+            render_frame(f, t, &mut scratch.rotated, &mut scratch.blend, w, h);
+            blend_bgra(dst, &scratch.blend, a);
+        }
+        (Some((f, t)), None) => render_frame(f, t, &mut scratch.rotated, dst, w, h),
+        (None, _) => pic.still.draw(dst, w, h),
     }
 }
 
@@ -242,7 +273,7 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
     let mut shm: Option<FrameShm> = None;
     let mut last_open_attempt: Option<Instant> = None;
     let mut out_bgra = Vec::new();
-    let mut scratch = Vec::new();
+    let mut scratch = Scratch::default();
     let mut nv12 = Vec::new();
     let mut prev_bgra = vec![0u8; (PREVIEW_WIDTH * PREVIEW_HEIGHT * 4) as usize];
     let mut seq = 0u64;
@@ -288,30 +319,47 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
             c.tick();
             (c.output_sources(), c.paused())
         };
-        let (frame, source) = if sources.muted {
-            (None, OutputSource::Muted)
+        let pick = |s: &Option<(Arc<crate::capture::Slot>, Transform)>| {
+            s.as_ref().and_then(|(s, t)| Some((s.frame.lock().clone()?, *t)))
+        };
+        let (frame, fade_from, source) = if sources.muted {
+            (None, None, OutputSource::Muted)
         } else if !(consumer_active || preview_visible) {
-            (None, OutputSource::Unwatched)
+            (None, None, OutputSource::Unwatched)
         } else {
-            let pick = |s: &Option<(Arc<crate::capture::Slot>, Transform)>| {
-                s.as_ref().and_then(|(s, t)| Some((s.frame.lock().clone()?, *t)))
-            };
             match pick(&sources.active) {
-                Some(f) => (Some(f), OutputSource::Active),
-                None => match pick(&sources.fallback) {
-                    Some(f) => (Some(f), OutputSource::Fallback),
-                    None => (None, OutputSource::Placeholder),
+                Some(f) => {
+                    let fade = sources.fade_from.as_ref().and_then(|(s, a)| Some((pick(&Some(s.clone()))?, *a)));
+                    match fade {
+                        Some(fade) => (Some(f), Some(fade), OutputSource::Fade),
+                        None => (Some(f), None, OutputSource::Active),
+                    }
+                }
+                // No picture from the new camera yet: keep the previous one.
+                None => match pick(&sources.fallback).or_else(|| pick(&sources.fade_from.as_ref().map(|(s, _)| s.clone()))) {
+                    Some(f) => (Some(f), None, OutputSource::Fallback),
+                    None => (None, None, OutputSource::Placeholder),
                 },
             }
         };
         let still = if sources.muted { &sources.muted_still } else { &sources.placeholder };
-        let key: RenderKey = (frame.as_ref().map_or(0, |(f, _)| f.id), sources.muted, w, h, sources.render_version);
-        let frame_ref = frame.as_ref().map(|(f, t)| (&**f, t));
+        let key = RenderKey {
+            frame: frame.as_ref().map_or(0, |(f, _)| f.id),
+            fade: fade_from.as_ref().map(|((f, _), a)| (f.id, (a * 255.0) as u8)),
+            muted: sources.muted,
+            size: (w, h),
+            version: sources.render_version,
+        };
+        let pic = Picture {
+            frame: frame.as_ref().map(|(f, t)| (&**f, t)),
+            fade_from: fade_from.as_ref().map(|((f, t), a)| (&**f, t, *a)),
+            still,
+        };
 
         let mut out_ready = false;
         if consumer_active && shm_key != Some(key) {
             let t = Instant::now();
-            render(frame_ref, still, &mut scratch, &mut out_bgra, w, h);
+            render(&pic, &mut scratch, &mut out_bgra, w, h);
             meters.render.add(ms_since(t));
             out_ready = true;
             if let Some(s) = &shm {
@@ -344,12 +392,12 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
                 scale_bgra_letterbox(&out_bgra, w, h, (w * 4) as usize, &mut prev_bgra, PREVIEW_WIDTH, PREVIEW_HEIGHT);
             } else if consumer_active {
                 // Shm is up to date but the preview isn't: show the output framing.
-                render(frame_ref, still, &mut scratch, &mut out_bgra, w, h);
+                render(&pic, &mut scratch, &mut out_bgra, w, h);
                 scale_bgra_letterbox(&out_bgra, w, h, (w * 4) as usize, &mut prev_bgra, PREVIEW_WIDTH, PREVIEW_HEIGHT);
             } else {
                 // No consumer: output is the default 16:9 size, same as the preview,
                 // so scale the camera frame straight to preview size.
-                render(frame_ref, still, &mut scratch, &mut prev_bgra, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+                render(&pic, &mut scratch, &mut prev_bgra, PREVIEW_WIDTH, PREVIEW_HEIGHT);
             }
             swap_rb(&mut prev_bgra);
             seq += 1;
