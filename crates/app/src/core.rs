@@ -102,6 +102,18 @@ impl Core {
         self.config.selected.iter().find(|s| s.link == link).map(|s| s.name.as_str())
     }
 
+    /// Short description of what the output shows, for the on-screen toast.
+    pub fn status_text(&self) -> String {
+        if self.muted {
+            return "Camera muted".into();
+        }
+        let Some(link) = self.active.as_deref() else { return "No camera".into() };
+        match self.config.selected.iter().position(|s| s.link == link) {
+            Some(i) => format!("{} · {}", i + 1, self.config.selected[i].name),
+            None => "No camera".into(),
+        }
+    }
+
     /// Activates the `index`-th selected camera (hotkey slot order).
     pub fn activate_index(&mut self, index: usize) {
         if let Some(link) = self.config.selected.get(index).map(|s| s.link.clone()) {

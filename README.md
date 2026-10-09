@@ -36,6 +36,16 @@ The virtual camera exists only while `camswitch.exe` runs.
 Shift is included because Ctrl+Alt equals AltGr on many keyboard layouts. All bindings can be changed in
 the app (Hotkeys section).
 
+## Tray, autostart, notifications
+
+- Closing the window hides it to the tray icon (blue, red while muted). Left-click shows the window, the
+  right-click menu switches cameras, mutes, toggles **Start with Windows** and quits.
+- **Start with Windows** adds `camswitch.exe --minimized` to `HKCU\...\CurrentVersion\Run`; `--minimized` (or
+  "Start minimized to tray") starts hidden in the tray.
+- After a hotkey or tray action a short on-screen notification shows the new camera or mute state.
+
+All of these can be switched off in the **General** section.
+
 ## Switch modes
 
 - **Instant**: all selected cameras stream, switching is immediate (more USB bandwidth/CPU).

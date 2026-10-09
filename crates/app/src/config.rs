@@ -55,7 +55,7 @@ impl Default for HotkeyConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub selected: Vec<SelectedCam>,
@@ -68,6 +68,29 @@ pub struct Config {
     pub muted_image: StillSource,
     /// Shown while the active camera has no picture yet (starting, switching, failed).
     pub placeholder_image: StillSource,
+    /// Closing the window hides it to the tray instead of quitting.
+    pub close_to_tray: bool,
+    /// Start hidden in the tray (also via `--minimized`).
+    pub start_minimized: bool,
+    /// Briefly show the new state on screen after a hotkey or tray action.
+    pub show_toast: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            selected: Vec::new(),
+            mode: SwitchMode::default(),
+            last_active: None,
+            hotkeys: HotkeyConfig::default(),
+            pause_when_idle: false,
+            muted_image: StillSource::default(),
+            placeholder_image: StillSource::default(),
+            close_to_tray: true,
+            start_minimized: false,
+            show_toast: true,
+        }
+    }
 }
 
 impl Config {
@@ -114,6 +137,8 @@ mod tests {
         c.pause_when_idle = true;
         c.muted_image = StillSource::Image(PathBuf::from(r"C:\pics\away.png"));
         c.placeholder_image = StillSource::Black;
+        c.close_to_tray = false;
+        c.start_minimized = true;
         let text = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.selected[0].name, "Cam A");
@@ -121,11 +146,13 @@ mod tests {
         assert!(back.pause_when_idle);
         assert_eq!(back.muted_image, c.muted_image);
         assert_eq!(back.placeholder_image, StillSource::Black);
+        assert!(!back.close_to_tray && back.start_minimized && back.show_toast);
 
         let partial: Config = toml::from_str("mode = \"Cold\"").unwrap();
         assert_eq!(partial.hotkeys.cameras.len(), CAMERA_HOTKEY_SLOTS);
         assert!(!partial.pause_when_idle);
         assert_eq!(partial.muted_image, StillSource::ColorBars);
+        assert!(partial.close_to_tray && !partial.start_minimized && partial.show_toast);
     }
 
     #[test]

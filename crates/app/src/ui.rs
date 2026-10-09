@@ -15,6 +15,7 @@ use crate::core::{Core, StillKind};
 use crate::devices::{DeviceInfo, DeviceList};
 use crate::hotkeys::{self, Action, Hotkeys};
 use crate::sysinfo::SysInfo;
+use crate::tray::{self, TrayView, WindowCtl};
 use crate::vcam::{VcamState, VirtualCamera};
 
 const DEVICE_REFRESH: Duration = Duration::from_secs(5);
@@ -35,6 +36,12 @@ pub struct App {
     /// Debug info window open (F12).
     pub show_debug: bool,
     pub sysinfo: SysInfo,
+    pub window: WindowCtl,
+    /// The tray icon exists, so the window may be hidden.
+    pub has_tray: bool,
+    /// Start hidden: eframe shows the window after its first frame, so hide
+    /// it again on the second. Counts frames drawn so far while set.
+    pub start_hidden: Option<u8>,
 }
 
 impl Drop for App {
@@ -273,6 +280,34 @@ impl App {
         });
     }
 
+    fn general_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("General").default_open(false).show(ui, |ui| {
+            let mut autostart = crate::autostart::is_enabled();
+            if ui.checkbox(&mut autostart, "Start with Windows").on_hover_text("Starts hidden in the tray when you sign in").changed()
+                && let Err(e) = crate::autostart::set(autostart)
+            {
+                log::warn!("autostart: {e}");
+            }
+            let mut core = self.core.lock();
+            let cfg = &mut core.config;
+            let mut changed = false;
+            ui.add_enabled_ui(self.has_tray, |ui| {
+                changed |= ui.checkbox(&mut cfg.start_minimized, "Start minimized to tray").changed();
+                changed |= ui
+                    .checkbox(&mut cfg.close_to_tray, "Close button hides to tray")
+                    .on_hover_text("Quit from the tray icon's menu")
+                    .changed();
+            });
+            changed |= ui
+                .checkbox(&mut cfg.show_toast, "On-screen notification on switch")
+                .on_hover_text("Shows the new camera or mute state for a moment after a hotkey or tray action")
+                .changed();
+            if changed {
+                cfg.save();
+            }
+        });
+    }
+
     fn hotkeys_ui(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Hotkeys").default_open(false).show(ui, |ui| {
             let hk = match &self.hotkeys {
@@ -383,7 +418,25 @@ impl eframe::App for App {
         if ctx.input(|i| i.viewport().visible().unwrap_or(true)) {
             self.ui_heartbeat.store(shared::shm::now_ms(), Ordering::Relaxed);
         }
+        if let Some(frames) = &mut self.start_hidden {
+            *frames += 1;
+            if *frames >= 2 {
+                self.window.hide();
+                self.start_hidden = None;
+            } else {
+                ctx.request_repaint();
+            }
+        }
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.has_tray
+            && !self.window.quitting.load(Ordering::Relaxed)
+            && self.core.lock().config.close_to_tray
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.window.hide();
+        }
         self.poll_devices();
+        tray::sync(&TrayView::of(&self.core.lock()));
         self.handle_recording(&ctx);
         self.update_texture(&ctx);
 
@@ -395,6 +448,8 @@ impl eframe::App for App {
                 self.controls_ui(ui);
                 ui.separator();
                 self.stills_ui(ui);
+                ui.separator();
+                self.general_ui(ui);
                 ui.separator();
                 self.hotkeys_ui(ui);
             });

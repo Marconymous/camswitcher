@@ -60,7 +60,8 @@ pub struct Hotkeys {
 }
 
 impl Hotkeys {
-    pub fn new(core: Arc<Mutex<Core>>, repaint: impl Fn() + Send + Sync + 'static) -> global_hotkey::Result<Self> {
+    /// `after` runs once an action was applied, without the core lock held.
+    pub fn new(core: Arc<Mutex<Core>>, after: impl Fn() + Send + Sync + 'static) -> global_hotkey::Result<Self> {
         let manager = GlobalHotKeyManager::new()?;
         let bindings: Arc<Mutex<HashMap<u32, Action>>> = Arc::default();
         {
@@ -79,7 +80,7 @@ impl Hotkeys {
                     Action::Camera(i) => c.activate_index(i),
                 }
                 drop(c);
-                repaint();
+                after();
             }));
         }
         Ok(Self { manager, registered: Vec::new(), bindings, errors: HashMap::new() })
