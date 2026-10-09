@@ -1,19 +1,21 @@
 //! 30 fps output loop: picks the active camera's latest frame, letterboxes it
 //! to the output size, writes NV12 to shared memory and a preview for the UI.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use shared::image::{bgra_to_nv12, blend_bgra, cover_rect, fill_black_bgra, fit_rect, rotate_bgra, scale_bgra_letterbox, scale_bgra_rect, swap_rb, zoom_rect};
+use shared::image::{alpha_blit, bgra_to_nv12, blend_bgra, scale_premul, shade_rect, cover_rect, fill_black_bgra, fit_rect, rotate_bgra, scale_bgra_letterbox, scale_bgra_rect, swap_rb, zoom_rect};
 use shared::shm::{FrameShm, MAX_HEIGHT, MAX_WIDTH, ShmHeader};
 use shared::stats::{Snapshot, Window};
 
 use crate::capture::Frame;
-use crate::config::{Fit, Rotation, Transform};
+use crate::config::{Anchor, Fit, Rotation, Transform};
+use crate::core::{OverlayContent, OverlayDraw};
 use crate::core::Core;
-use crate::stills::Still;
+use crate::stills::{Still, StillImage};
 
 pub const PREVIEW_WIDTH: u32 = 640;
 pub const PREVIEW_HEIGHT: u32 = 360;
@@ -208,6 +210,8 @@ struct RenderKey {
     frame: u64,
     /// Fading-out frame id and progress in 1/255.
     fade: Option<(u64, u8)>,
+    /// Picture-in-picture frame id, 0 = none.
+    pip: u64,
     muted: bool,
     size: (u32, u32),
     /// Stills / transforms version.
@@ -221,6 +225,9 @@ struct Picture<'a> {
     /// Previous camera and the new one's weight (0..1).
     fade_from: Option<(&'a Frame, &'a Transform, f32)>,
     still: &'a Still,
+    /// Inset camera, corner, width in percent.
+    pip: Option<(&'a Frame, &'a Transform, Anchor, u8)>,
+    overlays: &'a [OverlayDraw],
 }
 
 /// Reusable buffers for [`render`].
@@ -228,6 +235,11 @@ struct Picture<'a> {
 struct Scratch {
     rotated: Vec<u8>,
     blend: Vec<u8>,
+    pip: Vec<u8>,
+    /// Overlay bitmaps sized for an output: (overlay index, width, height).
+    overlays: HashMap<(usize, u32, u32), Option<Arc<StillImage>>>,
+    /// `render_version` the overlay bitmaps were made for.
+    overlays_version: u64,
 }
 
 /// Draws `pic` into `dst` (`w` x `h` BGRA).
@@ -241,6 +253,82 @@ fn render(pic: &Picture, scratch: &mut Scratch, dst: &mut Vec<u8>, w: u32, h: u3
         (Some((f, t)), None) => render_frame(f, t, &mut scratch.rotated, dst, w, h),
         (None, _) => pic.still.draw(dst, w, h),
     }
+    if let Some((f, t, corner, size_pct)) = pic.pip {
+        draw_pip((f, t), corner, size_pct, scratch, dst, w, h);
+    }
+    for o in pic.overlays {
+        draw_overlay(o, scratch, dst, w, h);
+    }
+}
+
+/// Distance of insets and overlays from the picture edge.
+fn margin(w: u32, h: u32) -> u32 {
+    (w.min(h) * 3 / 100).max(2) & !1
+}
+
+/// Top-left position of a `bw` x `bh` box anchored in a `w` x `h` picture.
+fn place(anchor: Anchor, bw: u32, bh: u32, w: u32, h: u32) -> (i32, i32) {
+    let m = margin(w, h) as i32;
+    let (w, h, bw, bh) = (w as i32, h as i32, bw as i32, bh as i32);
+    match anchor {
+        Anchor::TopLeft => (m, m),
+        Anchor::TopRight => (w - bw - m, m),
+        Anchor::BottomLeft => (m, h - bh - m),
+        Anchor::BottomRight => (w - bw - m, h - bh - m),
+        Anchor::Center => ((w - bw) / 2, (h - bh) / 2),
+    }
+}
+
+/// Second camera in a corner, same aspect as the output, thin white border.
+fn draw_pip((f, t): (&Frame, &Transform), corner: Anchor, size_pct: u8, scratch: &mut Scratch, dst: &mut [u8], w: u32, h: u32) {
+    let pw = (w * size_pct as u32 / 100) & !1;
+    let ph = ((pw as u64 * h as u64 / w as u64) as u32) & !1;
+    let border = (w / 640).max(1);
+    if pw < 8 || ph < 8 || pw + 2 * border > w || ph + 2 * border > h {
+        return;
+    }
+    let mut buf = std::mem::take(&mut scratch.pip);
+    render_frame(f, t, &mut scratch.rotated, &mut buf, pw, ph);
+    let (x, y) = place(corner, pw, ph, w, h);
+    let (x, y) = (x.max(border as i32) as u32, y.max(border as i32) as u32);
+    shade_rect(dst, w, (x - border, y - border, pw + 2 * border, ph + 2 * border), [255, 255, 255], 230);
+    scale_bgra_rect(&buf, (pw * 4) as usize, (0, 0, pw, ph), dst, w, (x, y, pw, ph), false);
+    scratch.pip = buf;
+}
+
+/// Text or image overlay; bitmaps are made once per output size.
+fn draw_overlay(o: &OverlayDraw, scratch: &mut Scratch, dst: &mut [u8], w: u32, h: u32) {
+    let bitmap = scratch
+        .overlays
+        .entry((o.index, w, h))
+        .or_insert_with(|| match &o.content {
+            OverlayContent::Text { text, .. } => {
+                let line = (h as f32 * o.size_pct / 100.0).round().max(4.0) as u32;
+                crate::text::render(text, line).map(Arc::new)
+            }
+            OverlayContent::Image(img) => {
+                let tw = (w as f32 * o.size_pct / 100.0).round().max(1.0) as u32;
+                let th = ((img.height as u64 * tw as u64 / img.width.max(1) as u64) as u32).max(1);
+                let mut bgra = Vec::new();
+                scale_premul(&img.bgra, img.width, img.height, &mut bgra, tw, th);
+                Some(Arc::new(StillImage { width: tw, height: th, bgra }))
+            }
+        })
+        .clone();
+    let Some(b) = bitmap else { return };
+    let (x, y) = place(o.anchor, b.width, b.height, w, h);
+    if let OverlayContent::Text { background: true, .. } = o.content {
+        // Dark box with padding, clipped to the picture.
+        let pad = (b.height as i32 / 5).max(2);
+        let x0 = (x - pad).max(0);
+        let y0 = (y - pad / 2).max(0);
+        let x1 = (x + b.width as i32 + pad).min(w as i32);
+        let y1 = (y + b.height as i32 + pad / 2).min(h as i32);
+        if x1 > x0 && y1 > y0 {
+            shade_rect(dst, w, (x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32), [0, 0, 0], 150);
+        }
+    }
+    alpha_blit(dst, w, h, &b.bgra, b.width, b.height, (x, y));
 }
 
 /// Rotate, zoom/pan, fit or fill, mirror.
@@ -343,9 +431,18 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
             }
         };
         let still = if sources.muted { &sources.muted_still } else { &sources.placeholder };
+        // Inset and overlays only on a live picture, never while muted.
+        let live = !sources.muted && (consumer_active || preview_visible);
+        let pip = sources.pip.as_ref().filter(|_| live).and_then(|p| Some((pick(&Some(p.source.clone()))?, p.corner, p.size_pct)));
+        let overlays: &[OverlayDraw] = if live { &sources.overlays } else { &[] };
+        if scratch.overlays_version != sources.render_version {
+            scratch.overlays.clear();
+            scratch.overlays_version = sources.render_version;
+        }
         let key = RenderKey {
             frame: frame.as_ref().map_or(0, |(f, _)| f.id),
             fade: fade_from.as_ref().map(|((f, _), a)| (f.id, (a * 255.0) as u8)),
+            pip: pip.as_ref().map_or(0, |((f, _), _, _)| f.id),
             muted: sources.muted,
             size: (w, h),
             version: sources.render_version,
@@ -354,6 +451,8 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
             frame: frame.as_ref().map(|(f, t)| (&**f, t)),
             fade_from: fade_from.as_ref().map(|((f, t), a)| (&**f, t, *a)),
             still,
+            pip: pip.as_ref().map(|((f, t), corner, size)| (&**f, t, *corner, *size)),
+            overlays,
         };
 
         let mut out_ready = false;

@@ -13,6 +13,7 @@ mod devices;
 mod hotkeys;
 mod stills;
 mod sysinfo;
+mod text;
 mod toast;
 mod tray;
 mod ui;
@@ -121,10 +122,10 @@ fn main() -> eframe::Result {
             let after_hotkey = {
                 let core = core.clone();
                 let ctx = cc.egui_ctx.clone();
-                move || {
+                move |action: hotkeys::Action| {
                     let (view, text, show_toast) = {
                         let c = core.lock();
-                        (tray::TrayView::of(&c), c.status_text(), c.config.show_toast)
+                        (tray::TrayView::of(&c), action.toast_text(&c), c.config.show_toast)
                     };
                     tray::sync(&view);
                     if show_toast {
@@ -135,7 +136,8 @@ fn main() -> eframe::Result {
             };
             let mut hotkeys = hotkeys::Hotkeys::new(core.clone(), after_hotkey).map_err(|e| e.to_string());
             if let Ok(h) = &mut hotkeys {
-                h.apply(&core.lock().config.hotkeys);
+                let c = core.lock();
+                h.apply(&c.config.hotkeys, c.config.scenes.len());
             }
 
             Ok(Box::new(ui::App {

@@ -1,13 +1,14 @@
 //! Switcher state: selected cameras, active camera, mute, Hot/Cold capture policy.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::capture::{CamStatus, Capture, Slot};
-use crate::config::{Config, SelectedCam, StillSource, SwitchMode, Transform, TransitionKind};
+use crate::config::{Anchor, Config, Overlay, OverlayKind, Pip, Scene, SelectedCam, StillSource, SwitchMode, Transform, TransitionKind};
 use crate::devices::{DeviceInfo, DeviceList};
-use crate::stills::Still;
+use crate::stills::{Still, StillImage};
 
 /// Which still picture: shown while muted, or while the active camera has no picture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,9 +37,11 @@ pub struct Core {
     stills: [Still; 2],
     /// Load errors of custom images, indexed by [`StillKind`].
     pub still_errors: [Option<String>; 2],
-    /// Bumped whenever a still or a camera transform changes, so the
-    /// compositor redraws.
+    /// Bumped whenever a still, a camera transform, picture-in-picture or an
+    /// overlay changes, so the compositor redraws.
     render_version: u64,
+    /// Decoded overlay images by path (or the load error).
+    overlay_images: HashMap<PathBuf, Result<Arc<StillImage>, String>>,
 }
 
 /// A crossfade from `from` to the active camera.
@@ -46,6 +49,26 @@ struct Fade {
     from: String,
     /// Set once the active camera has a picture.
     started: Option<Instant>,
+}
+
+/// Picture-in-picture inset for the compositor.
+pub struct PipDraw {
+    pub source: (Arc<Slot>, Transform),
+    pub corner: Anchor,
+    pub size_pct: u8,
+}
+
+pub enum OverlayContent {
+    Text { text: String, background: bool },
+    Image(Arc<StillImage>),
+}
+
+/// An overlay for the compositor; `index` into `Config::overlays`.
+pub struct OverlayDraw {
+    pub index: usize,
+    pub content: OverlayContent,
+    pub anchor: Anchor,
+    pub size_pct: f32,
 }
 
 /// What the compositor should show.
@@ -56,6 +79,8 @@ pub struct OutputSources {
     pub fade_from: Option<((Arc<Slot>, Transform), f32)>,
     pub muted: bool,
     pub muted_still: Still,
+    pub pip: Option<PipDraw>,
+    pub overlays: Vec<OverlayDraw>,
     pub placeholder: Still,
     pub render_version: u64,
 }
@@ -75,10 +100,12 @@ impl Core {
             stills: [Still::ColorBars, Still::ColorBars],
             still_errors: [None, None],
             render_version: 0,
+            overlay_images: HashMap::new(),
         };
         for kind in [StillKind::Muted, StillKind::Placeholder] {
             core.load_still(kind);
         }
+        core.load_overlay_images();
         // Never feed our own output back in (older configs may contain it).
         core.config.selected.retain(|s| !s.name.starts_with(shared::VCAM_FRIENDLY_NAME));
         core.active = core
@@ -290,6 +317,151 @@ impl Core {
         }
     }
 
+    fn pip_draw(&self) -> Option<PipDraw> {
+        let pip = &self.config.pip;
+        let link = pip.link.as_deref().filter(|l| pip.enabled && self.active.as_deref() != Some(*l))?;
+        Some(PipDraw { source: (self.slot(link)?.clone(), self.transform(link)), corner: pip.corner, size_pct: pip.size_pct })
+    }
+
+    fn overlay_draws(&self) -> Vec<OverlayDraw> {
+        if !self.config.overlays_visible {
+            return Vec::new();
+        }
+        self.config
+            .overlays
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.enabled)
+            .filter_map(|(index, o)| {
+                let content = match &o.kind {
+                    OverlayKind::Text { text, background } => {
+                        OverlayContent::Text { text: text.clone(), background: *background }
+                    }
+                    OverlayKind::Image { path } => OverlayContent::Image(self.overlay_images.get(path)?.as_ref().ok()?.clone()),
+                };
+                Some(OverlayDraw { index, content, anchor: o.anchor, size_pct: o.size_pct })
+            })
+            .collect()
+    }
+
+    /// Load error of an image overlay, if any.
+    pub fn overlay_error(&self, index: usize) -> Option<&str> {
+        match &self.config.overlays.get(index)?.kind {
+            OverlayKind::Image { path } => self.overlay_images.get(path)?.as_ref().err().map(String::as_str),
+            OverlayKind::Text { .. } => None,
+        }
+    }
+
+    /// Decodes images of new overlay paths, forgets unused ones.
+    fn load_overlay_images(&mut self) {
+        let paths: HashSet<PathBuf> = self
+            .config
+            .overlays
+            .iter()
+            .filter_map(|o| match &o.kind {
+                OverlayKind::Image { path } => Some(path.clone()),
+                OverlayKind::Text { .. } => None,
+            })
+            .collect();
+        self.overlay_images.retain(|p, _| paths.contains(p));
+        for path in paths {
+            self.overlay_images.entry(path).or_insert_with_key(|path| {
+                crate::stills::load_premul(path).map(Arc::new).inspect_err(|e| log::warn!("overlay {}: {e}", path.display()))
+            });
+        }
+    }
+
+    /// `save` writes the config (skip it while a slider is dragged).
+    pub fn set_pip(&mut self, pip: Pip, save: bool) {
+        if self.config.pip != pip {
+            self.config.pip = pip;
+            self.render_version += 1;
+            self.reconcile();
+        }
+        if save {
+            self.config.save();
+        }
+    }
+
+    pub fn toggle_pip(&mut self) {
+        let mut pip = self.config.pip.clone();
+        pip.enabled = !pip.enabled;
+        // First use: pick another camera than the active one.
+        if pip.enabled && pip.link.is_none() {
+            pip.link = self.present_selected().map(|s| s.link.clone()).find(|l| Some(l) != self.active.as_ref());
+        }
+        self.set_pip(pip, true);
+    }
+
+    /// `save` writes the config (skip it while typing or dragging).
+    pub fn set_overlays(&mut self, overlays: Vec<Overlay>, save: bool) {
+        if self.config.overlays != overlays {
+            self.config.overlays = overlays;
+            self.load_overlay_images();
+            self.render_version += 1;
+        }
+        if save {
+            self.config.save();
+        }
+    }
+
+    pub fn set_overlays_visible(&mut self, on: bool) {
+        if self.config.overlays_visible != on {
+            self.config.overlays_visible = on;
+            self.render_version += 1;
+            self.config.save();
+        }
+    }
+
+    pub fn toggle_overlays(&mut self) {
+        self.set_overlays_visible(!self.config.overlays_visible);
+    }
+
+    /// The current camera, picture-in-picture and overlay switches as a scene.
+    pub fn current_scene(&self, name: String) -> Scene {
+        Scene {
+            name,
+            active: self.active.clone(),
+            pip: self.config.pip.clone(),
+            overlays_visible: self.config.overlays_visible,
+            overlays_enabled: self.config.overlays.iter().map(|o| o.enabled).collect(),
+        }
+    }
+
+    pub fn add_scene(&mut self) {
+        let name = format!("Scene {}", self.config.scenes.len() + 1);
+        self.config.scenes.push(self.current_scene(name));
+        self.config.hotkeys.scenes.resize(self.config.scenes.len(), String::new());
+        self.config.save();
+    }
+
+    pub fn remove_scene(&mut self, index: usize) {
+        if index < self.config.scenes.len() {
+            self.config.scenes.remove(index);
+            if index < self.config.hotkeys.scenes.len() {
+                self.config.hotkeys.scenes.remove(index);
+            }
+            self.config.save();
+        }
+    }
+
+    /// Recalls scene `index`: camera (with the usual transition),
+    /// picture-in-picture and overlay switches.
+    pub fn apply_scene(&mut self, index: usize) {
+        let Some(scene) = self.config.scenes.get(index).cloned() else { return };
+        if let Some(link) = &scene.active {
+            self.activate(link);
+        }
+        let mut overlays = self.config.overlays.clone();
+        for (o, on) in overlays.iter_mut().zip(&scene.overlays_enabled) {
+            o.enabled = *on;
+        }
+        self.set_overlays(overlays, false);
+        self.config.overlays_visible = scene.overlays_visible;
+        self.render_version += 1;
+        self.set_pip(scene.pip, true);
+    }
+
     pub fn set_pause_when_idle(&mut self, on: bool) {
         if self.config.pause_when_idle != on {
             self.config.pause_when_idle = on;
@@ -353,6 +525,8 @@ impl Core {
             muted_still: self.stills[StillKind::Muted as usize].clone(),
             placeholder: self.stills[StillKind::Placeholder as usize].clone(),
             render_version: self.render_version,
+            pip: self.pip_draw(),
+            overlays: self.overlay_draws(),
         }
     }
 
@@ -366,6 +540,9 @@ impl Core {
         };
         wanted.extend(self.fallback.iter().cloned());
         wanted.extend(self.fade.iter().map(|f| f.from.clone()));
+        if self.config.pip.enabled {
+            wanted.extend(self.config.pip.link.iter().filter(|l| self.is_selected(l)).cloned());
+        }
         wanted.retain(|l| self.is_present(l));
         wanted
     }

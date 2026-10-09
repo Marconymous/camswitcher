@@ -18,6 +18,9 @@ pub enum Action {
     Next,
     Prev,
     Camera(usize),
+    TogglePip,
+    ToggleOverlays,
+    Scene(usize),
 }
 
 impl Action {
@@ -27,6 +30,9 @@ impl Action {
             Action::Next => &cfg.next,
             Action::Prev => &cfg.prev,
             Action::Camera(i) => cfg.cameras.get(i).map(String::as_str).unwrap_or(""),
+            Action::TogglePip => &cfg.pip,
+            Action::ToggleOverlays => &cfg.overlays,
+            Action::Scene(i) => cfg.scenes.get(i).map(String::as_str).unwrap_or(""),
         }
     }
 
@@ -41,13 +47,64 @@ impl Action {
                 }
                 cfg.cameras[i] = value;
             }
+            Action::TogglePip => cfg.pip = value,
+            Action::ToggleOverlays => cfg.overlays = value,
+            Action::Scene(i) => {
+                if cfg.scenes.len() <= i {
+                    cfg.scenes.resize(i + 1, String::new());
+                }
+                cfg.scenes[i] = value;
+            }
         }
     }
 
-    pub fn all(cfg: &HotkeyConfig) -> Vec<Action> {
+    /// Every bindable action; `scenes` is the number of saved scenes.
+    pub fn all(cfg: &HotkeyConfig, scenes: usize) -> Vec<Action> {
         let mut v = vec![Action::Mute, Action::Next, Action::Prev];
         v.extend((0..cfg.cameras.len()).map(Action::Camera));
+        v.extend([Action::TogglePip, Action::ToggleOverlays]);
+        v.extend((0..scenes).map(Action::Scene));
         v
+    }
+
+    /// Applies the action to `core`.
+    pub fn run(self, c: &mut Core) {
+        match self {
+            Action::Mute => c.toggle_mute(),
+            Action::Next => c.cycle(1),
+            Action::Prev => c.cycle(-1),
+            Action::Camera(i) => c.activate_index(i),
+            Action::TogglePip => c.toggle_pip(),
+            Action::ToggleOverlays => c.toggle_overlays(),
+            Action::Scene(i) => c.apply_scene(i),
+        }
+    }
+
+    /// On-screen notification after the action ran.
+    pub fn toast_text(self, c: &Core) -> String {
+        let on_off = |on: bool| if on { "on" } else { "off" };
+        match self {
+            Action::TogglePip => format!("Picture-in-picture {}", on_off(c.config.pip.enabled)),
+            Action::ToggleOverlays => format!("Overlays {}", on_off(c.config.overlays_visible)),
+            Action::Scene(i) => match c.config.scenes.get(i) {
+                Some(scene) => format!("Scene · {}", scene.name),
+                None => c.status_text(),
+            },
+            _ => c.status_text(),
+        }
+    }
+
+    /// Label in the hotkey list.
+    pub fn name(self, c: &Core) -> String {
+        match self {
+            Action::Mute => "Mute".to_string(),
+            Action::Next => "Next camera".to_string(),
+            Action::Prev => "Previous camera".to_string(),
+            Action::Camera(i) => format!("Camera {}", i + 1),
+            Action::TogglePip => "Picture-in-picture".to_string(),
+            Action::ToggleOverlays => "Overlays".to_string(),
+            Action::Scene(i) => format!("Scene: {}", c.config.scenes.get(i).map_or("?", |s| s.name.as_str())),
+        }
     }
 }
 
@@ -61,7 +118,7 @@ pub struct Hotkeys {
 
 impl Hotkeys {
     /// `after` runs once an action was applied, without the core lock held.
-    pub fn new(core: Arc<Mutex<Core>>, after: impl Fn() + Send + Sync + 'static) -> global_hotkey::Result<Self> {
+    pub fn new(core: Arc<Mutex<Core>>, after: impl Fn(Action) + Send + Sync + 'static) -> global_hotkey::Result<Self> {
         let manager = GlobalHotKeyManager::new()?;
         let bindings: Arc<Mutex<HashMap<u32, Action>>> = Arc::default();
         {
@@ -72,27 +129,20 @@ impl Hotkeys {
                 }
                 let Some(action) = bindings.lock().get(&ev.id()).copied() else { return };
                 log::info!("hotkey {action:?}");
-                let mut c = core.lock();
-                match action {
-                    Action::Mute => c.toggle_mute(),
-                    Action::Next => c.cycle(1),
-                    Action::Prev => c.cycle(-1),
-                    Action::Camera(i) => c.activate_index(i),
-                }
-                drop(c);
-                after();
+                action.run(&mut core.lock());
+                after(action);
             }));
         }
         Ok(Self { manager, registered: Vec::new(), bindings, errors: HashMap::new() })
     }
 
     /// (Re-)registers all hotkeys from `cfg`.
-    pub fn apply(&mut self, cfg: &HotkeyConfig) {
+    pub fn apply(&mut self, cfg: &HotkeyConfig, scenes: usize) {
         let _ = self.manager.unregister_all(&self.registered);
         self.registered.clear();
         self.errors.clear();
         let mut bindings = HashMap::new();
-        for action in Action::all(cfg) {
+        for action in Action::all(cfg, scenes) {
             let s = action.get(cfg);
             if s.is_empty() {
                 continue;

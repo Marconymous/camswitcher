@@ -1,5 +1,6 @@
 //! Notification-area icon with a menu: show the window, pick a camera, mute,
-//! autostart, quit. The icon turns red while muted.
+//! picture-in-picture, overlays, scenes, autostart, quit. The icon turns red
+//! while muted.
 //!
 //! Tray, menu and hotkey events are all delivered on the UI (main) thread by
 //! the window procedures of `tray-icon`, `muda` and `global-hotkey`, so the
@@ -12,10 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{self, ViewportCommand};
 use parking_lot::Mutex;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::core::Core;
+use crate::hotkeys::Action;
 
 /// Controls the main window from tray and hotkey handlers.
 #[derive(Clone)]
@@ -51,6 +53,9 @@ pub struct TrayView {
     cams: Vec<(String, bool)>,
     active: Option<usize>,
     muted: bool,
+    pip: bool,
+    overlays: bool,
+    scenes: Vec<String>,
 }
 
 impl TrayView {
@@ -59,6 +64,9 @@ impl TrayView {
             cams: core.config.selected.iter().map(|s| (s.name.clone(), core.is_present(&s.link))).collect(),
             active: core.active.as_deref().and_then(|a| core.config.selected.iter().position(|s| s.link == a)),
             muted: core.muted,
+            pip: core.config.pip.enabled,
+            overlays: core.config.overlays_visible,
+            scenes: core.config.scenes.iter().map(|s| s.name.clone()).collect(),
         }
     }
 
@@ -72,6 +80,8 @@ struct State {
     tray: TrayIcon,
     menu: Menu,
     mute: CheckMenuItem,
+    pip: CheckMenuItem,
+    overlays: CheckMenuItem,
     autostart: CheckMenuItem,
     cams: Vec<CheckMenuItem>,
     view: Option<TrayView>,
@@ -83,6 +93,9 @@ thread_local! {
 
 const ID_SHOW: &str = "show";
 const ID_MUTE: &str = "mute";
+const ID_PIP: &str = "pip";
+const ID_OVERLAYS: &str = "overlays";
+const SCENE_PREFIX: &str = "scene:";
 const ID_AUTOSTART: &str = "autostart";
 const ID_QUIT: &str = "quit";
 const CAM_PREFIX: &str = "cam:";
@@ -91,6 +104,8 @@ const CAM_PREFIX: &str = "cam:";
 pub fn create(core: Arc<Mutex<Core>>, window: WindowCtl) -> Result<(), String> {
     let menu = Menu::new();
     let mute = CheckMenuItem::with_id(ID_MUTE, "Mute camera", true, false, None);
+    let pip = CheckMenuItem::with_id(ID_PIP, "Picture-in-picture", true, false, None);
+    let overlays = CheckMenuItem::with_id(ID_OVERLAYS, "Overlays", true, false, None);
     let autostart = CheckMenuItem::with_id(ID_AUTOSTART, "Start with Windows", true, false, None);
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu.clone()))
@@ -99,7 +114,7 @@ pub fn create(core: Arc<Mutex<Core>>, window: WindowCtl) -> Result<(), String> {
         .with_tooltip("CamSwitch")
         .build()
         .map_err(|e| e.to_string())?;
-    STATE.with_borrow_mut(|s| *s = Some(State { tray, menu, mute, autostart, cams: Vec::new(), view: None }));
+    STATE.with_borrow_mut(|s| *s = Some(State { tray, menu, mute, pip, overlays, autostart, cams: Vec::new(), view: None }));
     sync(&TrayView::of(&core.lock()));
 
     {
@@ -125,29 +140,33 @@ pub fn create(core: Arc<Mutex<Core>>, window: WindowCtl) -> Result<(), String> {
 
     MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
         let id = ev.id.0.as_str();
-        let mut toast = false;
-        match id {
-            ID_SHOW => window.show(),
-            ID_QUIT => window.quit(),
+        let index = |prefix: &str| id.strip_prefix(prefix).and_then(|i| i.parse().ok());
+        let action = match id {
+            ID_SHOW => {
+                window.show();
+                None
+            }
+            ID_QUIT => {
+                window.quit();
+                None
+            }
             ID_AUTOSTART => {
                 if let Err(e) = crate::autostart::set(!crate::autostart::is_enabled()) {
                     log::warn!("autostart: {e}");
                 }
+                None
             }
-            ID_MUTE => {
-                core.lock().toggle_mute();
-                toast = true;
-            }
-            _ => {
-                if let Some(i) = id.strip_prefix(CAM_PREFIX).and_then(|i| i.parse().ok()) {
-                    core.lock().activate_index(i);
-                    toast = true;
-                }
-            }
-        }
+            ID_MUTE => Some(Action::Mute),
+            ID_PIP => Some(Action::TogglePip),
+            ID_OVERLAYS => Some(Action::ToggleOverlays),
+            _ => index(CAM_PREFIX).map(Action::Camera).or_else(|| index(SCENE_PREFIX).map(Action::Scene)),
+        };
         let (view, text, show_toast) = {
-            let c = core.lock();
-            (TrayView::of(&c), c.status_text(), c.config.show_toast)
+            let mut c = core.lock();
+            if let Some(a) = action {
+                a.run(&mut c);
+            }
+            (TrayView::of(&c), action.map(|a| a.toast_text(&c)), c.config.show_toast)
         };
         // Check items toggle themselves on click; force them back to the truth.
         view_changed(&view);
@@ -156,7 +175,7 @@ pub fn create(core: Arc<Mutex<Core>>, window: WindowCtl) -> Result<(), String> {
                 s.autostart.set_checked(crate::autostart::is_enabled());
             }
         });
-        if toast && show_toast {
+        if let Some(text) = text.filter(|_| show_toast) {
             crate::toast::show(&text);
         }
         window.ctx.request_repaint();
@@ -172,7 +191,7 @@ pub fn sync(view: &TrayView) {
             return;
         }
         let old = s.view.replace(view.clone());
-        if old.as_ref().map(|o| &o.cams) != Some(&view.cams) {
+        if old.as_ref().map(|o| (&o.cams, &o.scenes)) != Some((&view.cams, &view.scenes)) {
             rebuild(s, view);
         }
         if old.as_ref().map(|o| o.muted) != Some(view.muted) {
@@ -195,6 +214,8 @@ fn view_changed(view: &TrayView) {
 
 fn apply_checks(s: &State, view: &TrayView) {
     s.mute.set_checked(view.muted);
+    s.pip.set_checked(view.pip);
+    s.overlays.set_checked(view.overlays);
     for (i, item) in s.cams.iter().enumerate() {
         item.set_checked(view.active == Some(i));
     }
@@ -224,6 +245,15 @@ fn rebuild(s: &mut State, view: &TrayView) {
     }
     let _ = s.menu.append(&PredefinedMenuItem::separator());
     let _ = s.menu.append(&s.mute);
+    let _ = s.menu.append(&s.pip);
+    let _ = s.menu.append(&s.overlays);
+    if !view.scenes.is_empty() {
+        let scenes = Submenu::new("Scenes", true);
+        for (i, name) in view.scenes.iter().enumerate() {
+            let _ = scenes.append(&MenuItem::with_id(format!("{SCENE_PREFIX}{i}"), name, true, None));
+        }
+        let _ = s.menu.append(&scenes);
+    }
     let _ = s.menu.append(&PredefinedMenuItem::separator());
     let _ = s.menu.append(&s.autostart);
     let _ = s.menu.append(&quit);

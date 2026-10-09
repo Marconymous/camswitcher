@@ -42,6 +42,19 @@ pub fn scale_bgra_letterbox(src: &[u8], sw: u32, sh: u32, src_stride: usize, dst
 /// the `dst_rect` part of `dst` (BGRA, tightly packed, `dw` wide), mirrored
 /// horizontally if `mirror`. Bilinear; pixels outside `dst_rect` are untouched.
 pub fn scale_bgra_rect(src: &[u8], src_stride: usize, src_rect: Rect, dst: &mut [u8], dw: u32, dst_rect: Rect, mirror: bool) {
+    scale_rect::<false>(src, src_stride, src_rect, dst, dw, dst_rect, mirror);
+}
+
+/// Scales a whole premultiplied-alpha BGRA image (tightly packed) to
+/// `dw` x `dh`, keeping its alpha channel.
+pub fn scale_premul(src: &[u8], sw: u32, sh: u32, dst: &mut Vec<u8>, dw: u32, dh: u32) {
+    dst.resize((dw * dh * 4) as usize, 0);
+    scale_rect::<true>(src, (sw * 4) as usize, (0, 0, sw, sh), dst, dw, (0, 0, dw, dh), false);
+}
+
+/// Bilinear scaling; `ALPHA` interpolates the alpha channel instead of
+/// writing it opaque.
+fn scale_rect<const ALPHA: bool>(src: &[u8], src_stride: usize, src_rect: Rect, dst: &mut [u8], dw: u32, dst_rect: Rect, mirror: bool) {
     let (sx, sy, sw, sh) = src_rect;
     let (ox, oy, fw, fh) = dst_rect;
     if fw == 0 || fh == 0 || sw == 0 || sh == 0 {
@@ -49,7 +62,7 @@ pub fn scale_bgra_rect(src: &[u8], src_stride: usize, src_rect: Rect, dst: &mut 
     }
     let dst_stride = (dw * 4) as usize;
 
-    if fw == sw && fh == sh && !mirror {
+    if fw == sw && fh == sh && !mirror && !ALPHA {
         for y in 0..sh as usize {
             let s0 = (sy as usize + y) * src_stride + sx as usize * 4;
             let s = &src[s0..s0 + (sw * 4) as usize];
@@ -81,14 +94,17 @@ pub fn scale_bgra_rect(src: &[u8], src_stride: usize, src_rect: Rect, dst: &mut 
         let r0 = &src[(sy + y0) as usize * src_stride..];
         let r1 = &src[(sy + y1) as usize * src_stride..];
         let drow = &mut dst[(oy + dy) as usize * dst_stride + ox as usize * 4..];
+        let channels = if ALPHA { 4 } else { 3 };
         for (dx, &(x0, x1, wx)) in xs.iter().enumerate() {
             let d = &mut drow[dx * 4..dx * 4 + 4];
-            for c in 0..3 {
+            for c in 0..channels {
                 let top = r0[x0 + c] as u32 * (256 - wx) + r0[x1 + c] as u32 * wx;
                 let bot = r1[x0 + c] as u32 * (256 - wx) + r1[x1 + c] as u32 * wx;
                 d[c] = ((top * (256 - wy) + bot * wy + (1 << 15)) >> 16) as u8;
             }
-            d[3] = 255;
+            if !ALPHA {
+                d[3] = 255;
+            }
         }
     }
 }
@@ -284,6 +300,44 @@ pub fn blend_bgra(dst: &mut [u8], src: &[u8], t: f32) {
     }
 }
 
+/// Draws premultiplied BGRA `src` (`sw` x `sh`) over opaque `dst` (`dw` x
+/// `dh`) with its top-left corner at `(x, y)`; clipped to `dst`.
+pub fn alpha_blit(dst: &mut [u8], dw: u32, dh: u32, src: &[u8], sw: u32, sh: u32, (x, y): (i32, i32)) {
+    for sy in 0..sh as i32 {
+        let dy = y + sy;
+        if dy < 0 || dy >= dh as i32 {
+            continue;
+        }
+        let x0 = x.max(0);
+        let x1 = (x + sw as i32).min(dw as i32);
+        for dx in x0..x1 {
+            let s = ((sy as u32 * sw + (dx - x) as u32) * 4) as usize;
+            let d = ((dy as u32 * dw + dx as u32) * 4) as usize;
+            let a = src[s + 3] as u32;
+            if a == 0 {
+                continue;
+            }
+            for c in 0..3 {
+                dst[d + c] = (src[s + c] as u32 + (dst[d + c] as u32 * (255 - a) + 127) / 255).min(255) as u8;
+            }
+        }
+    }
+}
+
+/// Fills `rect` of `dst` (`dw` wide) with `bgr`, blended at `alpha` (0..=255).
+pub fn shade_rect(dst: &mut [u8], dw: u32, rect: Rect, bgr: [u8; 3], alpha: u8) {
+    let (x, y, w, h) = rect;
+    let a = alpha as u32;
+    for row in y..y + h {
+        let start = ((row * dw + x) * 4) as usize;
+        for px in dst[start..start + (w * 4) as usize].chunks_exact_mut(4) {
+            for c in 0..3 {
+                px[c] = ((px[c] as u32 * (255 - a) + bgr[c] as u32 * a + 127) / 255) as u8;
+            }
+        }
+    }
+}
+
 /// Swaps B and R in place (BGRA <-> RGBA).
 pub fn swap_rb(buf: &mut [u8]) {
     for px in buf.chunks_exact_mut(4) {
@@ -396,6 +450,27 @@ mod tests {
         let mut d = a;
         blend_bgra(&mut d, &b, 0.5);
         assert_eq!(d, [100, 50, 150, 255]);
+    }
+
+    #[test]
+    fn alpha_blit_composites_and_clips() {
+        let mut dst = [10u8, 10, 10, 255].repeat(4); // 2x2
+        // 2x1: opaque red, half-transparent white (premultiplied).
+        let src = [0u8, 0, 255, 255, 128, 128, 128, 128];
+        alpha_blit(&mut dst, 2, 2, &src, 2, 1, (1, 1));
+        assert_eq!(&dst[..12], &[10, 10, 10, 255].repeat(3)[..]);
+        assert_eq!(&dst[12..15], &[0, 0, 255]);
+        // Partly off-screen: no panic, untouched elsewhere.
+        alpha_blit(&mut dst, 2, 2, &src, 2, 1, (-1, -1));
+        alpha_blit(&mut dst, 2, 2, &src, 2, 1, (5, 0));
+    }
+
+    #[test]
+    fn scale_premul_keeps_alpha() {
+        let src = [0u8, 0, 0, 0].repeat(4);
+        let mut dst = Vec::new();
+        scale_premul(&src, 2, 2, &mut dst, 4, 4);
+        assert!(dst.iter().all(|&v| v == 0));
     }
 
     #[test]

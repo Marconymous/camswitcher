@@ -61,6 +61,15 @@ impl Still {
 
 /// Decodes an image file to opaque BGRA (transparency composited onto black).
 pub fn load(path: &Path) -> Result<StillImage, String> {
+    let mut img = load_premul(path)?;
+    for px in img.bgra.chunks_exact_mut(4) {
+        px[3] = 255;
+    }
+    Ok(img)
+}
+
+/// Decodes an image file to BGRA with premultiplied alpha.
+pub fn load_premul(path: &Path) -> Result<StillImage, String> {
     let img = image::ImageReader::open(path)
         .map_err(|e| e.to_string())?
         .with_guessed_format()
@@ -76,7 +85,6 @@ pub fn load(path: &Path) -> Result<StillImage, String> {
         px[0] = ((b * a + 127) / 255) as u8;
         px[1] = ((g * a + 127) / 255) as u8;
         px[2] = ((r * a + 127) / 255) as u8;
-        px[3] = 255;
     }
     Ok(StillImage { width, height, bgra })
 }

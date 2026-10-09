@@ -10,7 +10,10 @@ use parking_lot::Mutex;
 
 use crate::capture::CamStatus;
 use crate::compositor::{PREVIEW_HEIGHT, PREVIEW_WIDTH, Preview};
-use crate::config::{Fit, MAX_ZOOM, Rotation, StillSource, SwitchMode, TRANSITION_MS, Transform, TransitionKind};
+use crate::config::{
+    Anchor, Fit, MAX_ZOOM, Overlay, OverlayKind, PIP_SIZE_PCT, Rotation, StillSource, SwitchMode, TRANSITION_MS, Transform,
+    TransitionKind,
+};
 use crate::core::{Core, StillKind};
 use crate::devices::{DeviceInfo, DeviceList};
 use crate::hotkeys::{self, Action, Hotkeys};
@@ -350,16 +353,15 @@ impl App {
                     return;
                 }
             };
-            let cfg = self.core.lock().config.hotkeys.clone();
+            let (cfg, actions) = {
+                let core = self.core.lock();
+                let actions: Vec<(Action, String)> =
+                    Action::all(&core.config.hotkeys, core.config.scenes.len()).into_iter().map(|a| (a, a.name(&core))).collect();
+                (core.config.hotkeys.clone(), actions)
+            };
             let mut clear = None;
             egui::Grid::new("hotkeys").num_columns(3).striped(true).show(ui, |ui| {
-                for action in Action::all(&cfg) {
-                    let name = match action {
-                        Action::Mute => "Mute".to_string(),
-                        Action::Next => "Next camera".to_string(),
-                        Action::Prev => "Previous camera".to_string(),
-                        Action::Camera(i) => format!("Camera {}", i + 1),
-                    };
+                for (action, name) in actions {
                     ui.label(name);
                     let text = if self.recording == Some(action) {
                         "press keys… (Esc cancels)".to_string()
@@ -388,14 +390,216 @@ impl App {
     }
 
     fn set_hotkey(&mut self, action: Action, value: String) {
-        let mut core = self.core.lock();
-        action.set(&mut core.config.hotkeys, value);
-        core.config.save();
-        let cfg = core.config.hotkeys.clone();
-        drop(core);
-        if let Ok(h) = &mut self.hotkeys {
-            h.apply(&cfg);
+        {
+            let mut core = self.core.lock();
+            action.set(&mut core.config.hotkeys, value);
+            core.config.save();
         }
+        self.reapply_hotkeys();
+    }
+
+    /// Re-registers all hotkeys (bindings or the scene list changed).
+    fn reapply_hotkeys(&mut self) {
+        let (cfg, scenes) = {
+            let core = self.core.lock();
+            (core.config.hotkeys.clone(), core.config.scenes.len())
+        };
+        if let Ok(h) = &mut self.hotkeys {
+            h.apply(&cfg, scenes);
+        }
+    }
+
+    fn pip_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Picture-in-picture").default_open(false).show(ui, |ui| {
+            let mut core = self.core.lock();
+            let mut pip = core.config.pip.clone();
+            ui.checkbox(&mut pip.enabled, "Show a second camera in a corner")
+                .on_hover_text(hotkeys::display(&core.config.hotkeys.pip));
+            ui.add_enabled_ui(pip.enabled, |ui| {
+                egui::Grid::new("pip").num_columns(2).show(ui, |ui| {
+                    ui.label("Camera");
+                    let current = pip
+                        .link
+                        .as_deref()
+                        .and_then(|l| core.config.selected.iter().find(|s| s.link == l))
+                        .map_or("choose…", |s| s.name.as_str())
+                        .to_string();
+                    egui::ComboBox::from_id_salt("pip_cam").selected_text(current).show_ui(ui, |ui| {
+                        for cam in &core.config.selected {
+                            ui.selectable_value(&mut pip.link, Some(cam.link.clone()), &cam.name);
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Corner");
+                    egui::ComboBox::from_id_salt("pip_corner").selected_text(pip.corner.label()).show_ui(ui, |ui| {
+                        for a in Anchor::CORNERS {
+                            ui.selectable_value(&mut pip.corner, a, a.label());
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Size");
+                    ui.add(egui::Slider::new(&mut pip.size_pct, PIP_SIZE_PCT).suffix(" %"));
+                    ui.end_row();
+                });
+                ui.label(
+                    RichText::new("Hidden while the inset camera is the active one. Its own ⚙ adjustments apply.")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            });
+            if pip != core.config.pip {
+                core.set_pip(pip, false);
+                self.config_dirty = true;
+            }
+        });
+    }
+
+    fn overlays_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Overlays").default_open(false).show(ui, |ui| {
+            // `Some(None)`: new image overlay, `Some(Some(i))`: replace image of overlay i.
+            let mut pick: Option<Option<usize>> = None;
+            {
+                let mut core = self.core.lock();
+                let mut visible = core.config.overlays_visible;
+                if ui
+                    .checkbox(&mut visible, "Show overlays")
+                    .on_hover_text(hotkeys::display(&core.config.hotkeys.overlays))
+                    .changed()
+                {
+                    core.set_overlays_visible(visible);
+                }
+                let mut list = core.config.overlays.clone();
+                let mut remove = None;
+                for (i, o) in list.iter_mut().enumerate() {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut o.enabled, "");
+                            match &mut o.kind {
+                                OverlayKind::Text { text, background } => {
+                                    ui.add(egui::TextEdit::multiline(text).desired_rows(1).desired_width(170.0));
+                                    ui.checkbox(background, "box").on_hover_text("Dark box behind the text");
+                                }
+                                OverlayKind::Image { path } => {
+                                    let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+                                    if ui.button(name).on_hover_text(path.display().to_string()).clicked() {
+                                        pick = Some(Some(i));
+                                    }
+                                }
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("✖").on_hover_text("Remove").clicked() {
+                                    remove = Some(i);
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_id_salt(("overlay_anchor", i)).selected_text(o.anchor.label()).show_ui(ui, |ui| {
+                                for a in Anchor::ALL {
+                                    ui.selectable_value(&mut o.anchor, a, a.label());
+                                }
+                            });
+                            let (range, hint) = match o.kind {
+                                OverlayKind::Text { .. } => (2.0..=20.0, "text height, % of picture height"),
+                                OverlayKind::Image { .. } => (3.0..=60.0, "width, % of picture width"),
+                            };
+                            ui.add(egui::Slider::new(&mut o.size_pct, range).fixed_decimals(1).suffix(" %")).on_hover_text(hint);
+                        });
+                        if let Some(err) = core.overlay_error(i) {
+                            ui.label(RichText::new(format!("can't load image: {err}")).small().color(Color32::LIGHT_RED));
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    list.remove(i);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("+ Text").clicked() {
+                        list.push(Overlay::default());
+                    }
+                    if ui.button("+ Image…").clicked() {
+                        pick = Some(None);
+                    }
+                });
+                if list != core.config.overlays {
+                    core.set_overlays(list, false);
+                    self.config_dirty = true;
+                }
+            }
+            // Blocking dialog: never with the core lock held.
+            if let Some(target) = pick {
+                let dialog = rfd::FileDialog::new().add_filter("Images", crate::stills::EXTENSIONS);
+                if let Some(path) = dialog.pick_file() {
+                    let mut core = self.core.lock();
+                    let mut list = core.config.overlays.clone();
+                    match target.and_then(|i| list.get_mut(i)) {
+                        Some(o) => o.kind = OverlayKind::Image { path },
+                        None => list.push(Overlay {
+                            kind: OverlayKind::Image { path },
+                            anchor: Anchor::TopRight,
+                            size_pct: 15.0,
+                            ..Overlay::default()
+                        }),
+                    }
+                    core.set_overlays(list, true);
+                }
+            }
+        });
+    }
+
+    fn scenes_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Scenes").default_open(false).show(ui, |ui| {
+            let mut scenes_changed = false;
+            {
+                let mut core = self.core.lock();
+                let mut apply = None;
+                let mut update = None;
+                let mut remove = None;
+                let hotkeys_cfg = core.config.hotkeys.clone();
+                for (i, scene) in core.config.scenes.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.button("▶").on_hover_text("Apply").clicked() {
+                            apply = Some(i);
+                        }
+                        if ui.add(egui::TextEdit::singleline(&mut scene.name).desired_width(120.0)).changed() {
+                            self.config_dirty = true;
+                        }
+                        ui.label(
+                            RichText::new(hotkeys::display(Action::Scene(i).get(&hotkeys_cfg)))
+                                .small()
+                                .color(Color32::GRAY),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✖").on_hover_text("Delete").clicked() {
+                                remove = Some(i);
+                            }
+                            if ui.small_button("⟳").on_hover_text("Replace with the current setup").clicked() {
+                                update = Some(i);
+                            }
+                        });
+                    });
+                }
+                if let Some(i) = apply {
+                    core.apply_scene(i);
+                }
+                if let Some(i) = update {
+                    let name = core.config.scenes[i].name.clone();
+                    core.config.scenes[i] = core.current_scene(name);
+                    core.config.save();
+                }
+                if let Some(i) = remove {
+                    core.remove_scene(i);
+                    scenes_changed = true;
+                }
+                if ui.button("+ Save current as scene").on_hover_text("Active camera, picture-in-picture and overlay switches").clicked() {
+                    core.add_scene();
+                    scenes_changed = true;
+                }
+                ui.label(RichText::new("Assign scene hotkeys in the Hotkeys section.").small().color(Color32::GRAY));
+            }
+            if scenes_changed {
+                self.reapply_hotkeys();
+            }
+        });
     }
 
     fn handle_recording(&mut self, ctx: &egui::Context) {
@@ -519,6 +723,12 @@ impl eframe::App for App {
                 self.controls_ui(ui);
                 ui.separator();
                 self.stills_ui(ui);
+                ui.separator();
+                self.pip_ui(ui);
+                ui.separator();
+                self.overlays_ui(ui);
+                ui.separator();
+                self.scenes_ui(ui);
                 ui.separator();
                 self.general_ui(ui);
                 ui.separator();

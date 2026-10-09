@@ -32,6 +32,9 @@ The virtual camera exists only while `camswitch.exe` runs.
 | Camera 1–9       | Ctrl+Alt+Shift+1…9      |
 | Next / previous  | Ctrl+Alt+Shift+→ / ←    |
 | Mute (black)     | Ctrl+Alt+Shift+M        |
+| Picture-in-pic.  | Ctrl+Alt+Shift+P        |
+| Overlays on/off  | Ctrl+Alt+Shift+O        |
+| Scenes           | unassigned              |
 
 Shift is included because Ctrl+Alt equals AltGr on many keyboard layouts. All bindings can be changed in
 the app (Hotkeys section).
@@ -51,6 +54,17 @@ All of these can be switched off in the **General** section.
 The ⚙ button next to a selected camera opens per-camera settings: mirror, rotate (90° steps), digital
 zoom with pan, and fit (whole picture with black bars, or crop to fill the output). They apply to the
 preview and the virtual camera and are saved per camera.
+
+## Picture-in-picture, overlays, scenes
+
+- **Picture-in-picture** shows a second selected camera in a corner (size 10–50 % of the width). It is
+  hidden while that camera is the active one.
+- **Overlays** draw text (optionally on a dark box) or images (PNG transparency is kept) on top of the
+  output. Each has an anchor and a size relative to the picture. The *Show overlays* switch hides all of them.
+- **Scenes** save the active camera, picture-in-picture and overlay switches; recall them with ▶, a hotkey
+  or the tray menu.
+
+Nothing of this is drawn while muted.
 
 ## Switch modes
 
