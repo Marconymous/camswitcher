@@ -65,7 +65,8 @@ impl App {
 
         let builder = egui::ViewportBuilder::default()
             .with_title("CamSwitch – Debug info")
-            .with_inner_size([560.0, 680.0]);
+            .with_inner_size([560.0, 680.0])
+            .with_icon(crate::window_icon());
         let mut close = false;
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("debug"), builder, |ui, _class| {
             let ctx = ui.ctx().clone();

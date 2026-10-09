@@ -88,6 +88,7 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("CamSwitch").with_inner_size([1100.0, 640.0])
+            .with_icon(window_icon())
             .with_visible(!start_hidden),
         ..Default::default()
     };
@@ -162,4 +163,9 @@ fn main() -> eframe::Result {
             }))
         }),
     )
+}
+
+/// Title-bar / taskbar icon of the main and debug windows.
+pub fn window_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).expect("valid icon")
 }

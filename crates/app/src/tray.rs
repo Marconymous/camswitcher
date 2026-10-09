@@ -1,6 +1,6 @@
 //! Notification-area icon with a menu: show the window, pick a camera, mute,
-//! picture-in-picture, overlays, scenes, autostart, quit. The icon turns red
-//! while muted.
+//! picture-in-picture, overlays, scenes, autostart, quit. The icon gets a red
+//! slash while muted.
 //!
 //! Tray, menu and hotkey events are all delivered on the UI (main) thread by
 //! the window procedures of `tray-icon`, `muda` and `global-hotkey`, so the
@@ -259,26 +259,14 @@ fn rebuild(s: &mut State, view: &TrayView) {
     let _ = s.menu.append(&quit);
 }
 
-/// 32x32 camera glyph: blue normally, red while muted.
+/// 32x32 camera icon (rendered by `scripts/make-icon.py`); slashed while muted.
 fn icon(muted: bool) -> Icon {
-    const N: i32 = 32;
-    let color = if muted { [210, 50, 50] } else { [60, 140, 230] };
-    let mut rgba = vec![0u8; (N * N * 4) as usize];
-    for y in 0..N {
-        for x in 0..N {
-            // Body: rounded rectangle; lens: triangle pointing left.
-            let body = (3..=21).contains(&x) && (9..=23).contains(&y) && {
-                let cx = if x < 6 { 6 - x } else if x > 18 { x - 18 } else { 0 };
-                let cy = if y < 12 { 12 - y } else if y > 20 { y - 20 } else { 0 };
-                cx * cx + cy * cy <= 10
-            };
-            let lens = (22..=29).contains(&x) && (y - 16).abs() <= (x - 21);
-            let lens = lens && (10..=22).contains(&y);
-            if body || lens {
-                let i = ((y * N + x) * 4) as usize;
-                rgba[i..i + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
-            }
-        }
-    }
-    Icon::from_rgba(rgba, N as u32, N as u32).expect("valid icon")
+    let png: &[u8] = if muted {
+        include_bytes!("../assets/tray-muted.png")
+    } else {
+        include_bytes!("../assets/tray.png")
+    };
+    let img = image::load_from_memory(png).expect("valid icon").into_rgba8();
+    let (w, h) = img.dimensions();
+    Icon::from_rgba(img.into_raw(), w, h).expect("valid icon")
 }
