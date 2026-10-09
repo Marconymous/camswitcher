@@ -54,7 +54,30 @@ pub struct ShmHeader {
     pub writer_tick: AtomicU64,
     /// `GetTickCount64` of the last frame delivered by the DLL to a consumer.
     pub consumer_tick: AtomicU64,
+    // DLL statistics for the app's debug view. Appended after the original
+    // fields so older DLLs/apps keep working (they leave these at 0).
+    /// Non-zero once a DLL that fills the fields below is running.
+    pub dll_stats_version: AtomicU32,
+    /// Format negotiated with the consumer: 0 = none, 1 = NV12, 2 = RGB32.
+    pub consumer_format: AtomicU32,
+    /// Samples delivered to the consumer.
+    pub consumer_frames: AtomicU64,
+    /// Deliveries that repeated the previous app frame.
+    pub consumer_repeats: AtomicU64,
+    /// Deliveries of color bars or black instead of an app frame.
+    pub consumer_fallbacks: AtomicU64,
+    /// Failed sample productions.
+    pub consumer_errors: AtomicU64,
+    /// Age of the app frame at the DLL's last read, in ms.
+    pub consumer_frame_age_ms: AtomicU32,
+    /// Pending `RequestSample` tokens.
+    pub consumer_queue_depth: AtomicU32,
 }
+
+/// Value of [`ShmHeader::dll_stats_version`] written by this DLL version.
+pub const DLL_STATS_VERSION: u32 = 1;
+pub const CONSUMER_FORMAT_NV12: u32 = 1;
+pub const CONSUMER_FORMAT_RGB32: u32 = 2;
 
 const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_SIZE);
 
@@ -228,6 +251,15 @@ mod tests {
         let mut mem = vec![0u64; SHM_SIZE / 8 + 1];
         let shm = unsafe { FrameShm::from_raw(NonNull::new(mem.as_mut_ptr() as *mut u8).unwrap()) };
         (mem, shm)
+    }
+
+    #[test]
+    fn header_layout_is_stable() {
+        // Offsets of the original v1 fields must never move.
+        assert_eq!(std::mem::offset_of!(ShmHeader, seq), 16);
+        assert_eq!(std::mem::offset_of!(ShmHeader, frame_counter), 32);
+        assert_eq!(std::mem::offset_of!(ShmHeader, consumer_tick), 48);
+        assert!(std::mem::size_of::<ShmHeader>() <= HEADER_SIZE);
     }
 
     #[test]

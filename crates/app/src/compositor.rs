@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use shared::image::{bgra_to_nv12, scale_bgra_letterbox, swap_rb};
-use shared::shm::{FrameShm, MAX_HEIGHT, MAX_WIDTH};
+use shared::shm::{FrameShm, MAX_HEIGHT, MAX_WIDTH, ShmHeader};
+use shared::stats::{Snapshot, Window};
 
 use crate::capture::Frame;
 use crate::core::Core;
@@ -23,6 +24,159 @@ pub struct Preview {
     pub output_size: (u32, u32),
     pub shm_connected: bool,
     pub consumer_active: bool,
+    /// Refreshed once per second.
+    pub stats: CompositorStats,
+}
+
+/// What the output currently shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputSource {
+    #[default]
+    Placeholder,
+    Active,
+    /// Cold mode: previous camera while the new one starts.
+    Fallback,
+    Muted,
+    /// Nobody watches; no camera frame is used.
+    Unwatched,
+}
+
+/// Compositor loop numbers for the debug view. Timings in ms, rates per second.
+#[derive(Clone, Debug, Default)]
+pub struct CompositorStats {
+    pub loop_rate: f32,
+    /// Iterations that started behind schedule.
+    pub late_per_sec: f32,
+    pub work: Snapshot,
+    /// Letterboxing into the output size.
+    pub render: Snapshot,
+    pub nv12: Snapshot,
+    pub shm_write: Snapshot,
+    /// Unchanged frames not rewritten to shared memory.
+    pub skipped_per_sec: f32,
+    pub preview_per_sec: f32,
+    /// Camera capture to shared-memory write.
+    pub latency: Snapshot,
+    pub source: OutputSource,
+    pub paused: bool,
+    pub shm: Option<ShmSnapshot>,
+}
+
+/// Shared-memory header contents.
+#[derive(Clone, Debug, Default)]
+pub struct ShmSnapshot {
+    pub seq: u64,
+    pub frame_counter: u64,
+    pub req_size: (u32, u32),
+    pub writer_age_ms: u64,
+    pub consumer_age_ms: u64,
+    /// `None` when the loaded DLL predates the statistics fields.
+    pub dll: Option<DllStats>,
+}
+
+/// Virtual camera DLL counters, rates derived per second.
+#[derive(Clone, Debug, Default)]
+pub struct DllStats {
+    /// 0 = none, 1 = NV12, 2 = RGB32.
+    pub format: u32,
+    pub delivered_per_sec: f32,
+    pub repeats_per_sec: f32,
+    pub fallbacks_per_sec: f32,
+    pub frames_total: u64,
+    pub errors_total: u64,
+    pub frame_age_ms: u32,
+    pub queue_depth: u32,
+}
+
+/// Cumulative DLL counters at the previous snapshot.
+#[derive(Clone, Copy, Default)]
+struct DllCounters {
+    frames: u64,
+    repeats: u64,
+    fallbacks: u64,
+}
+
+fn shm_snapshot(hdr: &ShmHeader, prev: &mut Option<(Instant, DllCounters)>, now: Instant) -> ShmSnapshot {
+    let ms = shared::shm::now_ms();
+    let dll = (hdr.dll_stats_version.load(Ordering::Relaxed) != 0).then(|| {
+        let cur = DllCounters {
+            frames: hdr.consumer_frames.load(Ordering::Relaxed),
+            repeats: hdr.consumer_repeats.load(Ordering::Relaxed),
+            fallbacks: hdr.consumer_fallbacks.load(Ordering::Relaxed),
+        };
+        let (per_sec, old) = match prev.replace((now, cur)) {
+            Some((t, old)) => (1.0 / now.saturating_duration_since(t).as_secs_f32().max(0.001), old),
+            None => (0.0, cur),
+        };
+        DllStats {
+            format: hdr.consumer_format.load(Ordering::Relaxed),
+            delivered_per_sec: cur.frames.saturating_sub(old.frames) as f32 * per_sec,
+            repeats_per_sec: cur.repeats.saturating_sub(old.repeats) as f32 * per_sec,
+            fallbacks_per_sec: cur.fallbacks.saturating_sub(old.fallbacks) as f32 * per_sec,
+            frames_total: cur.frames,
+            errors_total: hdr.consumer_errors.load(Ordering::Relaxed),
+            frame_age_ms: hdr.consumer_frame_age_ms.load(Ordering::Relaxed),
+            queue_depth: hdr.consumer_queue_depth.load(Ordering::Relaxed),
+        }
+    });
+    ShmSnapshot {
+        seq: hdr.seq.load(Ordering::Relaxed),
+        frame_counter: hdr.frame_counter.load(Ordering::Relaxed),
+        req_size: (hdr.req_width.load(Ordering::Relaxed), hdr.req_height.load(Ordering::Relaxed)),
+        writer_age_ms: ms.saturating_sub(hdr.writer_tick.load(Ordering::Relaxed)),
+        consumer_age_ms: ms.saturating_sub(hdr.consumer_tick.load(Ordering::Relaxed)),
+        dll,
+    }
+}
+
+/// Per-second accumulators of the compositor loop.
+struct Meters {
+    loops: Window,
+    late: Window,
+    work: Window,
+    render: Window,
+    nv12: Window,
+    shm_write: Window,
+    skipped: Window,
+    preview: Window,
+    latency: Window,
+}
+
+impl Meters {
+    fn new() -> Self {
+        let t = Instant::now();
+        Self {
+            loops: Window::new(t),
+            late: Window::new(t),
+            work: Window::new(t),
+            render: Window::new(t),
+            nv12: Window::new(t),
+            shm_write: Window::new(t),
+            skipped: Window::new(t),
+            preview: Window::new(t),
+            latency: Window::new(t),
+        }
+    }
+
+    /// Fills the timing fields of `stats` once a window has passed.
+    fn take(&mut self, now: Instant, stats: &mut CompositorStats) -> bool {
+        let Some(loops) = self.loops.take_if_elapsed(now) else { return false };
+        let take = |w: &mut Window| w.take_if_elapsed(now).unwrap_or_default();
+        stats.loop_rate = loops.rate;
+        stats.late_per_sec = take(&mut self.late).rate;
+        stats.work = take(&mut self.work);
+        stats.render = take(&mut self.render);
+        stats.nv12 = take(&mut self.nv12);
+        stats.shm_write = take(&mut self.shm_write);
+        stats.skipped_per_sec = take(&mut self.skipped).rate;
+        stats.preview_per_sec = take(&mut self.preview).rate;
+        stats.latency = take(&mut self.latency);
+        true
+    }
+}
+
+fn ms_since(t: Instant) -> f32 {
+    t.elapsed().as_secs_f32() * 1000.0
 }
 
 /// The preview counts as hidden when the UI hasn't drawn for this long
@@ -72,8 +226,13 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
     let mut shm_key: Option<RenderKey> = None;
     let mut preview_key: Option<RenderKey> = None;
     let mut watched_at = Instant::now();
+    let mut meters = Meters::new();
+    let mut stats = CompositorStats::default();
+    let mut dll_prev = None;
 
     while !stop.load(Ordering::Relaxed) {
+        let loop_start = Instant::now();
+        meters.loops.tick();
         if shm.is_none() && last_open_attempt.is_none_or(|t| t.elapsed() > Duration::from_secs(1)) {
             last_open_attempt = Some(Instant::now());
             if let Ok(s) = FrameShm::open() {
@@ -99,31 +258,51 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
             watched_at = Instant::now();
         }
 
-        let sources = {
+        let (sources, paused) = {
             let mut c = core.lock();
             c.set_idle(watched_at.elapsed() >= IDLE_DELAY);
             c.tick();
-            c.output_sources()
+            (c.output_sources(), c.paused())
         };
-        let frame = if sources.muted || !(consumer_active || preview_visible) {
-            None
+        let (frame, source) = if sources.muted {
+            (None, OutputSource::Muted)
+        } else if !(consumer_active || preview_visible) {
+            (None, OutputSource::Unwatched)
         } else {
             let pick = |s: &Option<Arc<crate::capture::Slot>>| s.as_ref().and_then(|s| s.frame.lock().clone());
-            pick(&sources.active).or_else(|| pick(&sources.fallback))
+            match pick(&sources.active) {
+                Some(f) => (Some(f), OutputSource::Active),
+                None => match pick(&sources.fallback) {
+                    Some(f) => (Some(f), OutputSource::Fallback),
+                    None => (None, OutputSource::Placeholder),
+                },
+            }
         };
         let still = if sources.muted { &sources.muted_still } else { &sources.placeholder };
         let key: RenderKey = (frame.as_ref().map_or(0, |f| f.id), sources.muted, w, h, sources.stills_version);
 
         let mut out_ready = false;
         if consumer_active && shm_key != Some(key) {
+            let t = Instant::now();
             render(frame.as_deref(), still, &mut out_bgra, w, h);
+            meters.render.add(ms_since(t));
             out_ready = true;
             if let Some(s) = &shm {
+                let t = Instant::now();
                 bgra_to_nv12(&out_bgra, w, h, &mut nv12);
+                meters.nv12.add(ms_since(t));
+                let t = Instant::now();
                 s.write_frame(w, h, &nv12);
+                meters.shm_write.add(ms_since(t));
+                if let Some(f) = &frame {
+                    meters.latency.add(ms_since(f.captured));
+                }
             }
             shm_key = Some(key);
         } else if let Some(s) = &shm {
+            if consumer_active {
+                meters.skipped.tick();
+            }
             // Unchanged frame or nobody consuming: the buffer still holds the
             // latest picture, just keep the heartbeat alive.
             s.header().writer_tick.store(shared::shm::now_ms(), Ordering::Relaxed);
@@ -154,13 +333,26 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
             }
             prev_bgra.resize((PREVIEW_WIDTH * PREVIEW_HEIGHT * 4) as usize, 0);
             preview_key = Some(key);
+            meters.preview.tick();
             repaint_needed = true;
         } else if !preview_visible {
             preview_key = None;
         }
 
+        meters.work.add(ms_since(loop_start));
+        let now = Instant::now();
+        let stats_ready = meters.take(now, &mut stats);
+        if stats_ready {
+            stats.source = source;
+            stats.paused = paused;
+            stats.shm = shm.as_ref().filter(|s| s.is_initialized()).map(|s| shm_snapshot(s.header(), &mut dll_prev, now));
+        }
+
         {
             let mut p = preview.lock();
+            if stats_ready {
+                p.stats = stats.clone();
+            }
             let status = ((w, h), shm.is_some(), consumer_active);
             repaint_needed |= (p.output_size, p.shm_connected, p.consumer_active) != status;
             (p.output_size, p.shm_connected, p.consumer_active) = status;
@@ -172,6 +364,7 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
         let now = Instant::now();
         next += period;
         if next < now {
+            meters.late.tick();
             next = now;
         } else {
             std::thread::sleep(next - now);

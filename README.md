@@ -42,6 +42,13 @@ the app (Hotkeys section).
 - **On demand**: only the active camera streams; on a switch the previous camera keeps feeding the output
   until the new one delivers its first frame.
 
+## Debug info
+
+Press **F12** (or "🐞 Debug info" in the window) for a separate window with live stats: per-camera native
+format, fps, throughput and timings, compositor loop timings and latency, shared-memory state, virtual
+camera (DLL) delivery counters, and process CPU/memory. "Copy as text" puts everything on the clipboard
+for bug reports. DLL counters need a DLL built from the same version (re-run `register.ps1`).
+
 ## Logs
 
 - App: `%APPDATA%\CamSwitch\config\camswitch.log`, settings in `config.toml` next to it.

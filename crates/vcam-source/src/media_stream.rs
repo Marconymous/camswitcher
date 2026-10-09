@@ -2,6 +2,7 @@
 //! queued and served by a worker thread paced at [`shared::FPS`].
 
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -12,6 +13,8 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::core::{GUID, HRESULT, IUnknown, Interface, Ref, Result, implement};
+
+use shared::shm::{CONSUMER_FORMAT_NV12, CONSUMER_FORMAT_RGB32, DLL_STATS_VERSION};
 
 use crate::frames::FrameProvider;
 
@@ -246,7 +249,7 @@ fn worker(shared: Arc<Shared>) {
     let mut next = Instant::now();
     let mut errors = 0u32;
     loop {
-        let (token, format, allocator) = {
+        let (token, format, allocator, queue_depth) = {
             let mut st = shared.state.lock().unwrap();
             loop {
                 if st.shutdown {
@@ -259,7 +262,7 @@ fn worker(shared: Arc<Shared>) {
                 st = shared.cv.wait(st).unwrap();
             }
             let token = st.tokens.pop_front().unwrap();
-            (token, st.format.clone().unwrap(), st.allocator.clone().unwrap())
+            (token, st.format.clone().unwrap(), st.allocator.clone().unwrap(), st.tokens.len())
         };
 
         let now = Instant::now();
@@ -272,6 +275,14 @@ fn worker(shared: Arc<Shared>) {
         next += period;
 
         let result = produce(&mut frames, &format, &allocator, token.as_ref());
+        if let Some(hdr) = frames.header() {
+            let fmt = if format.subtype == MFVideoFormat_NV12 { CONSUMER_FORMAT_NV12 } else { CONSUMER_FORMAT_RGB32 };
+            hdr.consumer_format.store(fmt, Ordering::Relaxed);
+            hdr.consumer_queue_depth.store(queue_depth as u32, Ordering::Relaxed);
+            let counter = if result.is_ok() { &hdr.consumer_frames } else { &hdr.consumer_errors };
+            counter.fetch_add(1, Ordering::Relaxed);
+            hdr.dll_stats_version.store(DLL_STATS_VERSION, Ordering::Relaxed);
+        }
         let st = shared.state.lock().unwrap();
         if !st.running || st.shutdown {
             continue;

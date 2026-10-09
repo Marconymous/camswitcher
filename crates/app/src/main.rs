@@ -7,9 +7,11 @@ mod capture;
 mod compositor;
 mod config;
 mod core;
+mod debug_ui;
 mod devices;
 mod hotkeys;
 mod stills;
+mod sysinfo;
 mod ui;
 mod vcam;
 
@@ -74,6 +76,7 @@ fn main() -> eframe::Result {
         output_size: (shared::DEFAULT_WIDTH, shared::DEFAULT_HEIGHT),
         shm_connected: false,
         consumer_active: false,
+        stats: Default::default(),
     }));
     let vcam = vcam::VirtualCamera::start();
 
@@ -114,6 +117,8 @@ fn main() -> eframe::Result {
                 recording: None,
                 device_scan: None,
                 last_scan: Instant::now(),
+                show_debug: false,
+                sysinfo: sysinfo::SysInfo::new(),
             }))
         }),
     )

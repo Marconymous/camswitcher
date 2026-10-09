@@ -2,6 +2,7 @@
 
 pub mod image;
 pub mod shm;
+pub mod stats;
 
 /// CLSID of the virtual camera media source (COM class in `vcam_source.dll`).
 pub const VCAM_CLSID_STR: &str = "{A30A3BBE-F718-4438-97C6-DAC726888072}";

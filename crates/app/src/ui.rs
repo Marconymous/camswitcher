@@ -14,6 +14,7 @@ use crate::config::{StillSource, SwitchMode};
 use crate::core::{Core, StillKind};
 use crate::devices::{DeviceInfo, DeviceList};
 use crate::hotkeys::{self, Action, Hotkeys};
+use crate::sysinfo::SysInfo;
 use crate::vcam::{VcamState, VirtualCamera};
 
 const DEVICE_REFRESH: Duration = Duration::from_secs(5);
@@ -31,6 +32,9 @@ pub struct App {
     pub recording: Option<Action>,
     pub device_scan: Option<Receiver<DeviceList>>,
     pub last_scan: Instant,
+    /// Debug info window open (F12).
+    pub show_debug: bool,
+    pub sysinfo: SysInfo,
 }
 
 impl Drop for App {
@@ -203,6 +207,11 @@ impl App {
         };
         drop(p);
         ui.label(RichText::new(usage).small().color(Color32::GRAY));
+
+        ui.add_space(8.0);
+        if ui.selectable_label(self.show_debug, "🐞 Debug info").on_hover_text("Live throughput and internals (F12)").clicked() {
+            self.show_debug = !self.show_debug;
+        }
     }
 
     fn stills_ui(&mut self, ui: &mut egui::Ui) {
@@ -393,6 +402,7 @@ impl eframe::App for App {
         egui::CentralPanel::default_margins().frame(egui::Frame::NONE.fill(Color32::BLACK)).show(ui, |ui| {
             self.preview_ui(ui);
         });
+        self.debug_window(&ctx);
         // Keep polling device changes even without frames.
         ctx.request_repaint_after(Duration::from_millis(500));
     }
