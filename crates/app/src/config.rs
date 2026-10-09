@@ -27,7 +27,67 @@ pub struct SelectedCam {
     /// MF symbolic link; stable identity of the device.
     pub link: String,
     pub name: String,
+    #[serde(default)]
+    pub transform: Transform,
 }
+
+/// Clockwise rotation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Rotation {
+    #[default]
+    R0,
+    R90,
+    R180,
+    R270,
+}
+
+impl Rotation {
+    pub const ALL: [Rotation; 4] = [Rotation::R0, Rotation::R90, Rotation::R180, Rotation::R270];
+
+    pub fn quarter_turns(self) -> u32 {
+        self as u32
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Rotation::R0 => "0°",
+            Rotation::R90 => "90°",
+            Rotation::R180 => "180°",
+            Rotation::R270 => "270°",
+        }
+    }
+}
+
+/// How a camera picture with a different aspect ratio fills the output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Fit {
+    /// Whole picture, black bars.
+    #[default]
+    Letterbox,
+    /// Crop to fill the output.
+    Fill,
+}
+
+/// Per-camera picture adjustments, applied in the compositor.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Transform {
+    pub mirror: bool,
+    pub rotate: Rotation,
+    /// Digital zoom, 1.0 = whole picture.
+    pub zoom: f32,
+    /// Center of the zoomed part, 0..1 of the (rotated) picture.
+    pub center: [f32; 2],
+    pub fit: Fit,
+}
+
+impl Default for Transform {
+    fn default() -> Self {
+        Self { mirror: false, rotate: Rotation::R0, zoom: 1.0, center: [0.5, 0.5], fit: Fit::Letterbox }
+    }
+}
+
+pub const MAX_ZOOM: f32 = 4.0;
 
 /// Hotkeys in `global-hotkey` string form, e.g. `ctrl+alt+shift+KeyM`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -132,7 +192,11 @@ mod tests {
     #[test]
     fn roundtrip_and_partial() {
         let mut c = Config::default();
-        c.selected.push(SelectedCam { link: "\\\\?\\usb#a".into(), name: "Cam A".into() });
+        c.selected.push(SelectedCam { link: "\\\\?\\usb#a".into(), name: "Cam A".into(), transform: Transform::default() });
+        c.selected[0].transform.mirror = true;
+        c.selected[0].transform.rotate = Rotation::R270;
+        c.selected[0].transform.zoom = 2.5;
+        c.selected[0].transform.fit = Fit::Fill;
         c.mode = SwitchMode::Cold;
         c.pause_when_idle = true;
         c.muted_image = StillSource::Image(PathBuf::from(r"C:\pics\away.png"));
@@ -142,6 +206,11 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back.selected[0].name, "Cam A");
+        assert_eq!(back.selected[0].transform, c.selected[0].transform);
+
+        // Cameras saved before transforms existed.
+        let old: Config = toml::from_str("[[selected]]\nlink = 'x'\nname = 'X'").unwrap();
+        assert_eq!(old.selected[0].transform, Transform::default());
         assert_eq!(back.mode, SwitchMode::Cold);
         assert!(back.pause_when_idle);
         assert_eq!(back.muted_image, c.muted_image);

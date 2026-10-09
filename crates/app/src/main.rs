@@ -155,6 +155,8 @@ fn main() -> eframe::Result {
                 window,
                 has_tray,
                 start_hidden: (start_hidden && has_tray).then_some(0),
+                editing: None,
+                transform_dirty: false,
             }))
         }),
     )

@@ -46,6 +46,12 @@ the app (Hotkeys section).
 
 All of these can be switched off in the **General** section.
 
+## Picture adjustments
+
+The ⚙ button next to a selected camera opens per-camera settings: mirror, rotate (90° steps), digital
+zoom with pan, and fit (whole picture with black bars, or crop to fill the output). They apply to the
+preview and the virtual camera and are saved per camera.
+
 ## Switch modes
 
 - **Instant**: all selected cameras stream, switching is immediate (more USB bandwidth/CPU).

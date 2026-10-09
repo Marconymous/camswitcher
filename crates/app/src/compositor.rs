@@ -6,11 +6,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use shared::image::{bgra_to_nv12, scale_bgra_letterbox, swap_rb};
+use shared::image::{bgra_to_nv12, cover_rect, fill_black_bgra, fit_rect, rotate_bgra, scale_bgra_letterbox, scale_bgra_rect, swap_rb, zoom_rect};
 use shared::shm::{FrameShm, MAX_HEIGHT, MAX_WIDTH, ShmHeader};
 use shared::stats::{Snapshot, Window};
 
 use crate::capture::Frame;
+use crate::config::{Fit, Rotation, Transform};
 use crate::core::Core;
 use crate::stills::Still;
 
@@ -199,18 +200,40 @@ pub fn spawn(
 }
 
 /// Identity of what was last rendered: frame id (0 = none), mute, output size,
-/// stills version.
+/// stills/transform version.
 type RenderKey = (u64, bool, u32, u32, u64);
 
-/// Letterboxes `frame` into `dst` (`w` x `h` BGRA), or draws `still` without one.
-fn render(frame: Option<&Frame>, still: &Still, dst: &mut Vec<u8>, w: u32, h: u32) {
+/// Draws `frame` with its camera's adjustments into `dst` (`w` x `h` BGRA),
+/// or `still` without one. `scratch` holds the rotated frame.
+fn render(frame: Option<(&Frame, &Transform)>, still: &Still, scratch: &mut Vec<u8>, dst: &mut Vec<u8>, w: u32, h: u32) {
     match frame {
-        Some(f) => {
-            dst.resize((w * h * 4) as usize, 0);
-            scale_bgra_letterbox(&f.data, f.width, f.height, (f.width * 4) as usize, dst, w, h);
-        }
+        Some((f, t)) => render_frame(f, t, scratch, dst, w, h),
         None => still.draw(dst, w, h),
     }
+}
+
+/// Rotate, zoom/pan, fit or fill, mirror.
+fn render_frame(f: &Frame, t: &Transform, scratch: &mut Vec<u8>, dst: &mut Vec<u8>, w: u32, h: u32) {
+    dst.resize((w * h * 4) as usize, 0);
+    let (src, sw, sh) = if t.rotate == Rotation::R0 {
+        (&f.data[..], f.width, f.height)
+    } else {
+        let (rw, rh) = rotate_bgra(&f.data, f.width, f.height, (f.width * 4) as usize, t.rotate.quarter_turns(), scratch);
+        (&scratch[..], rw, rh)
+    };
+    let mut src_rect = zoom_rect(sw, sh, t.zoom, t.center);
+    let dst_rect = match t.fit {
+        Fit::Letterbox => fit_rect(src_rect.2, src_rect.3, w, h),
+        Fit::Fill => {
+            let (x, y, cw, ch) = cover_rect(src_rect.2, src_rect.3, w, h);
+            src_rect = (src_rect.0 + x, src_rect.1 + y, cw, ch);
+            (0, 0, w, h)
+        }
+    };
+    if dst_rect.2 != w || dst_rect.3 != h {
+        fill_black_bgra(dst);
+    }
+    scale_bgra_rect(src, (sw * 4) as usize, src_rect, dst, w, dst_rect, t.mirror);
 }
 
 fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<AtomicU64>, repaint: impl Fn(), stop: Arc<AtomicBool>) {
@@ -219,6 +242,7 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
     let mut shm: Option<FrameShm> = None;
     let mut last_open_attempt: Option<Instant> = None;
     let mut out_bgra = Vec::new();
+    let mut scratch = Vec::new();
     let mut nv12 = Vec::new();
     let mut prev_bgra = vec![0u8; (PREVIEW_WIDTH * PREVIEW_HEIGHT * 4) as usize];
     let mut seq = 0u64;
@@ -269,7 +293,9 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
         } else if !(consumer_active || preview_visible) {
             (None, OutputSource::Unwatched)
         } else {
-            let pick = |s: &Option<Arc<crate::capture::Slot>>| s.as_ref().and_then(|s| s.frame.lock().clone());
+            let pick = |s: &Option<(Arc<crate::capture::Slot>, Transform)>| {
+                s.as_ref().and_then(|(s, t)| Some((s.frame.lock().clone()?, *t)))
+            };
             match pick(&sources.active) {
                 Some(f) => (Some(f), OutputSource::Active),
                 None => match pick(&sources.fallback) {
@@ -279,12 +305,13 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
             }
         };
         let still = if sources.muted { &sources.muted_still } else { &sources.placeholder };
-        let key: RenderKey = (frame.as_ref().map_or(0, |f| f.id), sources.muted, w, h, sources.stills_version);
+        let key: RenderKey = (frame.as_ref().map_or(0, |(f, _)| f.id), sources.muted, w, h, sources.render_version);
+        let frame_ref = frame.as_ref().map(|(f, t)| (&**f, t));
 
         let mut out_ready = false;
         if consumer_active && shm_key != Some(key) {
             let t = Instant::now();
-            render(frame.as_deref(), still, &mut out_bgra, w, h);
+            render(frame_ref, still, &mut scratch, &mut out_bgra, w, h);
             meters.render.add(ms_since(t));
             out_ready = true;
             if let Some(s) = &shm {
@@ -294,7 +321,7 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
                 let t = Instant::now();
                 s.write_frame(w, h, &nv12);
                 meters.shm_write.add(ms_since(t));
-                if let Some(f) = &frame {
+                if let Some((f, _)) = &frame {
                     meters.latency.add(ms_since(f.captured));
                 }
             }
@@ -317,12 +344,12 @@ fn run(core: Arc<Mutex<Core>>, preview: Arc<Mutex<Preview>>, ui_heartbeat: Arc<A
                 scale_bgra_letterbox(&out_bgra, w, h, (w * 4) as usize, &mut prev_bgra, PREVIEW_WIDTH, PREVIEW_HEIGHT);
             } else if consumer_active {
                 // Shm is up to date but the preview isn't: show the output framing.
-                render(frame.as_deref(), still, &mut out_bgra, w, h);
+                render(frame_ref, still, &mut scratch, &mut out_bgra, w, h);
                 scale_bgra_letterbox(&out_bgra, w, h, (w * 4) as usize, &mut prev_bgra, PREVIEW_WIDTH, PREVIEW_HEIGHT);
             } else {
                 // No consumer: output is the default 16:9 size, same as the preview,
                 // so scale the camera frame straight to preview size.
-                render(frame.as_deref(), still, &mut prev_bgra, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+                render(frame_ref, still, &mut scratch, &mut prev_bgra, PREVIEW_WIDTH, PREVIEW_HEIGHT);
             }
             swap_rb(&mut prev_bgra);
             seq += 1;

@@ -23,47 +23,63 @@ pub fn fill_black_bgra(dst: &mut [u8]) {
     }
 }
 
+/// A rectangle `(x, y, w, h)` in pixels.
+pub type Rect = (u32, u32, u32, u32);
+
 /// Scales `src` (BGRA, `src_stride` bytes per row) into `dst` (BGRA, tightly
 /// packed `dw` x `dh`), preserving aspect ratio with black bars. Bilinear.
 pub fn scale_bgra_letterbox(src: &[u8], sw: u32, sh: u32, src_stride: usize, dst: &mut [u8], dw: u32, dh: u32) {
     let dst_len = (dw * dh * 4) as usize;
     let dst = &mut dst[..dst_len];
-    let (ox, oy, fw, fh) = fit_rect(sw, sh, dw, dh);
-    if fw != dw || fh != dh {
+    let fit = fit_rect(sw, sh, dw, dh);
+    if fit.2 != dw || fit.3 != dh {
         fill_black_bgra(dst);
     }
-    if fw == 0 || fh == 0 {
+    scale_bgra_rect(src, src_stride, (0, 0, sw, sh), dst, dw, fit, false);
+}
+
+/// Scales the `src_rect` part of `src` (BGRA, `src_stride` bytes per row) onto
+/// the `dst_rect` part of `dst` (BGRA, tightly packed, `dw` wide), mirrored
+/// horizontally if `mirror`. Bilinear; pixels outside `dst_rect` are untouched.
+pub fn scale_bgra_rect(src: &[u8], src_stride: usize, src_rect: Rect, dst: &mut [u8], dw: u32, dst_rect: Rect, mirror: bool) {
+    let (sx, sy, sw, sh) = src_rect;
+    let (ox, oy, fw, fh) = dst_rect;
+    if fw == 0 || fh == 0 || sw == 0 || sh == 0 {
         return;
     }
     let dst_stride = (dw * 4) as usize;
 
-    if fw == sw && fh == sh {
+    if fw == sw && fh == sh && !mirror {
         for y in 0..sh as usize {
-            let s = &src[y * src_stride..y * src_stride + (sw * 4) as usize];
+            let s0 = (sy as usize + y) * src_stride + sx as usize * 4;
+            let s = &src[s0..s0 + (sw * 4) as usize];
             let d0 = (oy as usize + y) * dst_stride + ox as usize * 4;
             dst[d0..d0 + s.len()].copy_from_slice(s);
         }
         return;
     }
 
-    // Per-column source indices and weights (8-bit fixed point).
-    let xs: Vec<(usize, usize, u32)> = (0..fw)
+    // Per-column source byte offsets and weights (8-bit fixed point).
+    let mut xs: Vec<(usize, usize, u32)> = (0..fw)
         .map(|dx| {
             let fx = ((dx as f32 + 0.5) * sw as f32 / fw as f32 - 0.5).max(0.0);
             let x0 = (fx as u32).min(sw - 1);
             let x1 = (x0 + 1).min(sw - 1);
             let w = ((fx - x0 as f32) * 256.0) as u32;
-            (x0 as usize * 4, x1 as usize * 4, w.min(256))
+            ((sx + x0) as usize * 4, (sx + x1) as usize * 4, w.min(256))
         })
         .collect();
+    if mirror {
+        xs.reverse();
+    }
 
     for dy in 0..fh {
         let fy = ((dy as f32 + 0.5) * sh as f32 / fh as f32 - 0.5).max(0.0);
         let y0 = (fy as u32).min(sh - 1);
         let y1 = (y0 + 1).min(sh - 1);
         let wy = (((fy - y0 as f32) * 256.0) as u32).min(256);
-        let r0 = &src[y0 as usize * src_stride..];
-        let r1 = &src[y1 as usize * src_stride..];
+        let r0 = &src[(sy + y0) as usize * src_stride..];
+        let r1 = &src[(sy + y1) as usize * src_stride..];
         let drow = &mut dst[(oy + dy) as usize * dst_stride + ox as usize * 4..];
         for (dx, &(x0, x1, wx)) in xs.iter().enumerate() {
             let d = &mut drow[dx * 4..dx * 4 + 4];
@@ -75,6 +91,56 @@ pub fn scale_bgra_letterbox(src: &[u8], sw: u32, sh: u32, src_stride: usize, dst
             d[3] = 255;
         }
     }
+}
+
+/// Largest centered part of a `sw` x `sh` source with the aspect ratio of
+/// `dw` x `dh` (crop-to-fill counterpart of [`fit_rect`]).
+pub fn cover_rect(sw: u32, sh: u32, dw: u32, dh: u32) -> Rect {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return (0, 0, sw, sh);
+    }
+    let (w, h) = if (sw as u64) * (dh as u64) > (sh as u64) * (dw as u64) {
+        (((sh as u64 * dw as u64) / dh as u64).max(1) as u32, sh)
+    } else {
+        (sw, ((sw as u64 * dh as u64) / dw as u64).max(1) as u32)
+    };
+    ((sw - w) / 2, (sh - h) / 2, w, h)
+}
+
+/// Digital zoom: the `1/zoom` sized part of a `sw` x `sh` source centered on
+/// `center` (0..1 each), shifted to stay inside the source.
+pub fn zoom_rect(sw: u32, sh: u32, zoom: f32, center: [f32; 2]) -> Rect {
+    let zoom = zoom.max(1.0);
+    let w = ((sw as f32 / zoom).round() as u32).clamp(1, sw.max(1));
+    let h = ((sh as f32 / zoom).round() as u32).clamp(1, sh.max(1));
+    let place = |size: u32, part: u32, c: f32| -> u32 {
+        let start = c.clamp(0.0, 1.0) * size as f32 - part as f32 / 2.0;
+        (start.round().max(0.0) as u32).min(size.saturating_sub(part))
+    };
+    (place(sw, w, center[0]), place(sh, h, center[1]), w, h)
+}
+
+/// Rotates `src` (BGRA, `w` x `h`, `stride` bytes per row) clockwise by
+/// `quarter_turns` x 90° into `dst` (tightly packed). Returns the new size.
+pub fn rotate_bgra(src: &[u8], w: u32, h: u32, stride: usize, quarter_turns: u32, dst: &mut Vec<u8>) -> (u32, u32) {
+    let turns = quarter_turns % 4;
+    let (nw, nh) = if turns % 2 == 1 { (h, w) } else { (w, h) };
+    dst.resize((nw * nh * 4) as usize, 0);
+    let (w, h, nw) = (w as usize, h as usize, nw as usize);
+    for y in 0..h {
+        let row = &src[y * stride..y * stride + w * 4];
+        for x in 0..w {
+            let (dx, dy) = match turns {
+                0 => (x, y),
+                1 => (h - 1 - y, x),
+                2 => (w - 1 - x, h - 1 - y),
+                _ => (y, w - 1 - x),
+            };
+            let d = (dy * nw + dx) * 4;
+            dst[d..d + 4].copy_from_slice(&row[x * 4..x * 4 + 4]);
+        }
+    }
+    (nw as u32, nh)
 }
 
 /// Converts tightly packed BGRA (`w` x `h`, both even) to NV12.
@@ -269,6 +335,44 @@ mod tests {
         assert_eq!(px(w / 2, 700), [50, 0, 106]); // +Q
         assert_eq!(px(762, 700), [19, 19, 19]); // black
         assert_eq!(px(10, 700), [0, 33, 76]); // -I
+    }
+
+    /// 2x1 image: left red, right blue (BGRA).
+    fn red_blue() -> Vec<u8> {
+        vec![0, 0, 255, 255, 255, 0, 0, 255]
+    }
+
+    #[test]
+    fn mirror_flips_columns() {
+        let src = red_blue();
+        let mut dst = vec![0u8; 8];
+        scale_bgra_rect(&src, 8, (0, 0, 2, 1), &mut dst, 2, (0, 0, 2, 1), true);
+        assert_eq!(&dst[..4], &src[4..]);
+        assert_eq!(&dst[4..], &src[..4]);
+    }
+
+    #[test]
+    fn rotate_quarter_turns() {
+        // 2x1 -> 1x2, clockwise: left pixel ends up on top.
+        let src = red_blue();
+        let mut dst = Vec::new();
+        assert_eq!(rotate_bgra(&src, 2, 1, 8, 1, &mut dst), (1, 2));
+        assert_eq!(&dst[..4], &src[..4]);
+        assert_eq!(rotate_bgra(&src, 2, 1, 8, 3, &mut dst), (1, 2));
+        assert_eq!(&dst[..4], &src[4..]);
+        assert_eq!(rotate_bgra(&src, 2, 1, 8, 2, &mut dst), (2, 1));
+        assert_eq!(&dst[..4], &src[4..]);
+    }
+
+    #[test]
+    fn cover_and_zoom_rects() {
+        // 4:3 source filling 16:9: full width, cropped height.
+        assert_eq!(cover_rect(640, 480, 1280, 720), (0, 60, 640, 360));
+        assert_eq!(cover_rect(1920, 1080, 1280, 720), (0, 0, 1920, 1080));
+        assert_eq!(zoom_rect(1920, 1080, 1.0, [0.5, 0.5]), (0, 0, 1920, 1080));
+        assert_eq!(zoom_rect(1920, 1080, 2.0, [0.5, 0.5]), (480, 270, 960, 540));
+        // Panned past the edge: clamped inside.
+        assert_eq!(zoom_rect(1920, 1080, 2.0, [1.0, 0.0]), (960, 0, 960, 540));
     }
 
     #[test]

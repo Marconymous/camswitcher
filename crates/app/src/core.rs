@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::capture::{CamStatus, Capture, Slot};
-use crate::config::{Config, SelectedCam, StillSource, SwitchMode};
+use crate::config::{Config, SelectedCam, StillSource, SwitchMode, Transform};
 use crate::devices::{DeviceInfo, DeviceList};
 use crate::stills::Still;
 
@@ -33,18 +33,19 @@ pub struct Core {
     stills: [Still; 2],
     /// Load errors of custom images, indexed by [`StillKind`].
     pub still_errors: [Option<String>; 2],
-    /// Bumped whenever a still changes, so the compositor redraws.
-    stills_version: u64,
+    /// Bumped whenever a still or a camera transform changes, so the
+    /// compositor redraws.
+    render_version: u64,
 }
 
 /// What the compositor should show.
 pub struct OutputSources {
-    pub active: Option<Arc<Slot>>,
-    pub fallback: Option<Arc<Slot>>,
+    pub active: Option<(Arc<Slot>, Transform)>,
+    pub fallback: Option<(Arc<Slot>, Transform)>,
     pub muted: bool,
     pub muted_still: Still,
     pub placeholder: Still,
-    pub stills_version: u64,
+    pub render_version: u64,
 }
 
 impl Core {
@@ -60,7 +61,7 @@ impl Core {
             idle: false,
             stills: [Still::ColorBars, Still::ColorBars],
             still_errors: [None, None],
-            stills_version: 0,
+            render_version: 0,
         };
         for kind in [StillKind::Muted, StillKind::Placeholder] {
             core.load_still(kind);
@@ -164,7 +165,11 @@ impl Core {
 
     pub fn set_selected(&mut self, dev: &DeviceInfo, on: bool) {
         if on && !self.is_selected(&dev.link) {
-            self.config.selected.push(SelectedCam { link: dev.link.clone(), name: dev.name.clone() });
+            self.config.selected.push(SelectedCam {
+                link: dev.link.clone(),
+                name: dev.name.clone(),
+                transform: Transform::default(),
+            });
             if self.active.is_none() {
                 self.active = Some(dev.link.clone());
             }
@@ -212,6 +217,24 @@ impl Core {
         self.reconcile();
     }
 
+    pub fn transform(&self, link: &str) -> Transform {
+        self.config.selected.iter().find(|s| s.link == link).map(|s| s.transform).unwrap_or_default()
+    }
+
+    /// Changes a camera's picture adjustments; `save` writes the config (skip
+    /// it while a slider is dragged).
+    pub fn set_transform(&mut self, link: &str, t: Transform, save: bool) {
+        if let Some(cam) = self.config.selected.iter_mut().find(|s| s.link == link)
+            && cam.transform != t
+        {
+            cam.transform = t;
+            self.render_version += 1;
+        }
+        if save {
+            self.config.save();
+        }
+    }
+
     pub fn still_source(&self, kind: StillKind) -> &StillSource {
         match kind {
             StillKind::Muted => &self.config.muted_image,
@@ -235,7 +258,7 @@ impl Core {
         let (still, error) = Still::resolve(self.still_source(kind));
         self.stills[kind as usize] = still;
         self.still_errors[kind as usize] = error;
-        self.stills_version += 1;
+        self.render_version += 1;
     }
 
     pub fn set_pause_when_idle(&mut self, on: bool) {
@@ -277,12 +300,12 @@ impl Core {
 
     pub fn output_sources(&self) -> OutputSources {
         OutputSources {
-            active: self.active.as_deref().and_then(|a| self.slot(a)).cloned(),
-            fallback: self.fallback.as_deref().and_then(|f| self.slot(f)).cloned(),
+            active: self.active.as_deref().and_then(|a| Some((self.slot(a)?.clone(), self.transform(a)))),
+            fallback: self.fallback.as_deref().and_then(|f| Some((self.slot(f)?.clone(), self.transform(f)))),
             muted: self.muted,
             muted_still: self.stills[StillKind::Muted as usize].clone(),
             placeholder: self.stills[StillKind::Placeholder as usize].clone(),
-            stills_version: self.stills_version,
+            render_version: self.render_version,
         }
     }
 

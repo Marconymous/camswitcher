@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 
 use crate::capture::CamStatus;
 use crate::compositor::{PREVIEW_HEIGHT, PREVIEW_WIDTH, Preview};
-use crate::config::{StillSource, SwitchMode};
+use crate::config::{Fit, MAX_ZOOM, Rotation, StillSource, SwitchMode, Transform};
 use crate::core::{Core, StillKind};
 use crate::devices::{DeviceInfo, DeviceList};
 use crate::hotkeys::{self, Action, Hotkeys};
@@ -42,6 +42,10 @@ pub struct App {
     /// Start hidden: eframe shows the window after its first frame, so hide
     /// it again on the second. Counts frames drawn so far while set.
     pub start_hidden: Option<u8>,
+    /// Camera whose picture adjustments are open (symbolic link).
+    pub editing: Option<String>,
+    /// A transform changed while a slider was held; saved on release.
+    pub transform_dirty: bool,
 }
 
 impl Drop for App {
@@ -122,6 +126,12 @@ impl App {
                     core.activate(&cam.link);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let open = self.editing.as_deref() == Some(cam.link.as_str());
+                    let adjusted = cam.transform != Transform::default();
+                    let gear = if adjusted { RichText::new("⚙").color(Color32::from_rgb(80, 160, 230)) } else { RichText::new("⚙") };
+                    if ui.add(egui::Button::selectable(open, gear).small()).on_hover_text("Mirror, rotate, zoom, fill").clicked() {
+                        self.editing = if open { None } else { Some(cam.link.clone()) };
+                    }
                     if ui.add_enabled(i + 1 < count, egui::Button::new("⏷").small()).clicked() {
                         core.move_selected(i, false);
                     }
@@ -143,6 +153,14 @@ impl App {
                 }
             };
             ui.indent(("status", i), |ui| ui.label(status.small()));
+            if self.editing.as_deref() == Some(cam.link.as_str()) {
+                let mut t = core.transform(&cam.link);
+                ui.indent(("transform", i), |ui| transform_ui(ui, &mut t));
+                if t != core.transform(&cam.link) {
+                    core.set_transform(&cam.link, t, false);
+                    self.transform_dirty = true;
+                }
+            }
         }
 
         let unselected: Vec<DeviceInfo> =
@@ -410,6 +428,44 @@ impl App {
     }
 }
 
+/// Editor for one camera's picture adjustments.
+fn transform_ui(ui: &mut egui::Ui, t: &mut Transform) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        egui::Grid::new("transform").num_columns(2).spacing([8.0, 4.0]).show(ui, |ui| {
+            ui.label("Mirror");
+            ui.checkbox(&mut t.mirror, "flip left/right");
+            ui.end_row();
+            ui.label("Rotate");
+            ui.horizontal(|ui| {
+                for r in Rotation::ALL {
+                    ui.selectable_value(&mut t.rotate, r, r.label());
+                }
+            });
+            ui.end_row();
+            ui.label("Fit");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut t.fit, Fit::Letterbox, "Whole picture");
+                ui.selectable_value(&mut t.fit, Fit::Fill, "Fill (crop)");
+            });
+            ui.end_row();
+            ui.label("Zoom");
+            ui.add(egui::Slider::new(&mut t.zoom, 1.0..=MAX_ZOOM).fixed_decimals(1).suffix("×"));
+            ui.end_row();
+            ui.add_enabled_ui(t.zoom > 1.0, |ui| ui.label("Pan"));
+            ui.add_enabled_ui(t.zoom > 1.0, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Slider::new(&mut t.center[0], 0.0..=1.0).show_value(false).text("↔"));
+                    ui.add(egui::Slider::new(&mut t.center[1], 0.0..=1.0).show_value(false).text("↕"));
+                });
+            });
+            ui.end_row();
+        });
+        if ui.add_enabled(*t != Transform::default(), egui::Button::new("Reset")).clicked() {
+            *t = Transform::default();
+        }
+    });
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -458,6 +514,11 @@ impl eframe::App for App {
             self.preview_ui(ui);
         });
         self.debug_window(&ctx);
+        // Slider drags change the transform every frame; write the config once released.
+        if self.transform_dirty && !ctx.input(|i| i.pointer.any_down()) {
+            self.transform_dirty = false;
+            self.core.lock().config.save();
+        }
         // Keep polling device changes even without frames.
         ctx.request_repaint_after(Duration::from_millis(500));
     }
